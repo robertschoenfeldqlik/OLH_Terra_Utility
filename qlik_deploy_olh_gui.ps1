@@ -312,6 +312,12 @@ function Apply-AwsAuth {
 #region ── Step 0: Welcome ────────────────────────────────────
 
 function Get-LatestTerraformVersion {
+    # Ensure TLS 1.2 (PS 5.1 default is too old for HashiCorp / GitHub)
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor `
+            [Net.SecurityProtocolType]::Tls12
+    } catch { }
     # Try official HashiCorp releases API first, fall back to checkpoint API
     try {
         $r = Invoke-WebRequest -Uri "https://api.releases.hashicorp.com/v1/releases/terraform/latest" -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop | Select-Object -ExpandProperty Content | ConvertFrom-Json
@@ -320,6 +326,21 @@ function Get-LatestTerraformVersion {
     try {
         $r = Invoke-WebRequest -Uri "https://checkpoint-api.hashicorp.com/v1/check/terraform" -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop | Select-Object -ExpandProperty Content | ConvertFrom-Json
         if ($r.current_version) { return $r.current_version }
+    } catch { }
+    return $null
+}
+
+function Get-LatestAwsCliVersion {
+    # Fetch latest AWS CLI v2 tag from GitHub. Anonymous calls are rate-limited
+    # (60/hr per IP) but a wizard run hits this at most twice -- well under.
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor `
+            [Net.SecurityProtocolType]::Tls12
+    } catch { }
+    try {
+        $tags = Invoke-RestMethod -Uri "https://api.github.com/repos/aws/aws-cli/tags?per_page=1" -UseBasicParsing -TimeoutSec 8 -ErrorAction Stop
+        if ($tags -and $tags[0].name) { return $tags[0].name }
     } catch { }
     return $null
 }
@@ -339,17 +360,27 @@ function Run-ToolCheck {
     $awsFound = [bool](Get-Command "aws" -ErrorAction SilentlyContinue)
     $script:State.AwsCliOk = $awsFound
     if ($awsFound) {
+        $awsInstalled = $null
         try {
             $raw = (aws --version 2>&1) -replace "`n",""
-            # Extract just "aws-cli/2.x.x" to avoid wrapping
-            if ($raw -match '(aws-cli/[\d\.]+)') { $v = $Matches[1] } else { $v = "found" }
-        } catch { $v = "found" }
+            if ($raw -match 'aws-cli/([\d\.]+)') { $awsInstalled = $Matches[1] }
+        } catch { }
+        $v = if ($awsInstalled) { "v$awsInstalled" } else { "found" }
         $script:State.AwsCliVersion = $v
-        $script:Controls['lblAwsStatus'].Text = "[OK]  AWS CLI - $v   (latest installer always pulls v2)"
-        $script:Controls['lblAwsStatus'].ForeColor = [System.Drawing.Color]::DarkGreen
-        # Always offer an "Update" path -- the AWS MSI will upgrade in place
-        $script:Controls['btnInstallAws'].Text    = "Update AWS CLI..."
-        $script:Controls['btnInstallAws'].Visible = $true
+
+        $awsLatest = Get-LatestAwsCliVersion
+        if ($awsLatest -and $awsInstalled -and (Test-VersionOutdated $awsInstalled $awsLatest)) {
+            $script:Controls['lblAwsStatus'].Text = "[ ! ]  AWS CLI - $v installed, latest is v$awsLatest"
+            $script:Controls['lblAwsStatus'].ForeColor = [System.Drawing.Color]::FromArgb(180,130,0)
+            $script:Controls['btnInstallAws'].Text    = "Update to v$awsLatest..."
+            $script:Controls['btnInstallAws'].Visible = $true
+        } else {
+            $latestNote = if ($awsLatest) { " (latest: v$awsLatest)" } else { "" }
+            $script:Controls['lblAwsStatus'].Text = "[OK]  AWS CLI - $v$latestNote"
+            $script:Controls['lblAwsStatus'].ForeColor = [System.Drawing.Color]::DarkGreen
+            $script:Controls['btnInstallAws'].Text    = "Reinstall AWS CLI..."
+            $script:Controls['btnInstallAws'].Visible = $true
+        }
     } else {
         $script:Controls['lblAwsStatus'].Text = "[ X ]  AWS CLI - NOT FOUND (required)"
         $script:Controls['lblAwsStatus'].ForeColor = [System.Drawing.Color]::Red

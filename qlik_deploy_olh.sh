@@ -46,6 +46,13 @@ TERRAFORM_OK=false
 AWS_OK=false
 PYTHON_OK=false
 
+# ── Inline yes/no prompt (the full confirm() is defined later) ──
+_yn_prompt() {
+  local msg="$1" ans
+  read -rp "  ${msg} [y/N]: " ans
+  [[ "$ans" =~ ^[Yy]$ ]]
+}
+
 # ── Detect OS package manager ─────────────────────────────────
 detect_pkg_manager() {
   if   command -v apt-get &>/dev/null; then echo "apt"
@@ -115,40 +122,71 @@ install_tool() {
             | python3 -c "import sys,json; print(json.load(sys.stdin)['current_version'])" 2>/dev/null)
         fi
         # Fallback to a known-recent version if both APIs fail
-        [[ -z "$tf_ver" ]] && tf_ver="1.15.0"
+        [[ -z "$tf_ver" ]] && tf_ver="1.15.1"
         echo -e "    ${GRY}Latest version: ${tf_ver}${RST}"
 
-        local tf_url="https://releases.hashicorp.com/terraform/${tf_ver}/terraform_${tf_ver}_linux_amd64.zip"
-        # macOS override
-        [[ "$(uname)" == "Darwin" ]] && \
-          tf_url="https://releases.hashicorp.com/terraform/${tf_ver}/terraform_${tf_ver}_darwin_amd64.zip"
+        # Pick arch (amd64 / arm64) and OS
+        local arch; arch=$(uname -m)
+        case "$arch" in
+          x86_64|amd64) arch="amd64" ;;
+          aarch64|arm64) arch="arm64" ;;
+          *)            arch="amd64" ;;  # default; HashiCorp publishes amd64 + arm64
+        esac
+        local os="linux"
+        [[ "$(uname)" == "Darwin" ]] && os="darwin"
+        local tf_url="https://releases.hashicorp.com/terraform/${tf_ver}/terraform_${tf_ver}_${os}_${arch}.zip"
 
         local tf_zip="/tmp/terraform_${tf_ver}.zip"
         local tf_dest="/usr/local/bin"
 
         echo -e "    ${GRY}${ARW} Downloading: ${tf_url}${RST}"
-        curl -fsSL "$tf_url" -o "$tf_zip" || {
-          echo -e "    ${RED}${ERR}  Download failed.${RST}"; return 1; }
+        if ! curl -fSL "$tf_url" -o "$tf_zip"; then
+          echo -e "    ${RED}${ERR}  Download failed (network / proxy issue?).${RST}"
+          rm -f "$tf_zip"; return 1
+        fi
+        if [[ ! -s "$tf_zip" ]]; then
+          echo -e "    ${RED}${ERR}  Downloaded zip is empty.${RST}"; rm -f "$tf_zip"; return 1
+        fi
+
+        # Try writing without sudo first; fall back to sudo if dir not writable
+        local sudo_cmd=""
+        [[ ! -w "$tf_dest" ]] && sudo_cmd="sudo"
+        [[ -n "$sudo_cmd" ]] && echo -e "    ${GRY}${ARW} ${tf_dest} requires sudo for write.${RST}"
 
         echo -e "    ${GRY}${ARW} Extracting to ${tf_dest} ...${RST}"
         if command -v unzip &>/dev/null; then
-          unzip -o "$tf_zip" terraform -d "$tf_dest" &>/dev/null
+          if ! $sudo_cmd unzip -o "$tf_zip" terraform -d "$tf_dest"; then
+            echo -e "    ${RED}${ERR}  Extraction failed.${RST}"; rm -f "$tf_zip"; return 1
+          fi
         else
-          python3 -c "
-import zipfile, sys
+          # Python fallback when unzip isn't available
+          local extract_script="/tmp/tf_extract_$$.py"
+          cat > "$extract_script" <<PYEOF
+import zipfile, os, sys
 with zipfile.ZipFile('${tf_zip}') as z:
     z.extract('terraform', '${tf_dest}')
-"
+PYEOF
+          if ! $sudo_cmd python3 "$extract_script"; then
+            echo -e "    ${RED}${ERR}  Python extraction failed.${RST}"
+            rm -f "$tf_zip" "$extract_script"; return 1
+          fi
+          rm -f "$extract_script"
         fi
-        chmod +x "${tf_dest}/terraform"
+        $sudo_cmd chmod +x "${tf_dest}/terraform"
         rm -f "$tf_zip"
 
+        # Force PATH refresh in case /usr/local/bin wasn't already on it
+        case ":$PATH:" in
+          *":${tf_dest}:"*) ;;
+          *) export PATH="${tf_dest}:$PATH" ;;
+        esac
+
         if command -v terraform &>/dev/null; then
-          local ver; ver=$(terraform version -json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['terraform_version'])" 2>/dev/null || echo "installed")
-          echo -e "    ${GRN}${OK}  Terraform v${ver} installed successfully.${RST}"
+          local ver; ver=$(terraform version -json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['terraform_version'])" 2>/dev/null || echo "$tf_ver")
+          echo -e "    ${GRN}${OK}  Terraform v${ver} installed.${RST}"
           return 0
         else
-          echo -e "    ${YLW}${WRN}  Extracted but not found in PATH. You may need to re-open your shell.${RST}"
+          echo -e "    ${YLW}${WRN}  Extracted to ${tf_dest} but 'terraform' not on PATH. Re-open your shell.${RST}"
           return 1
         fi
 
@@ -158,23 +196,56 @@ with zipfile.ZipFile('${tf_zip}') as z:
         local aws_dir="/tmp/aws"
         echo -e "    ${GRY}${ARW} Downloading AWS CLI v2 ...${RST}"
 
+        # Snapshot pre-install version so we can detect upgrade vs first-install
+        local pre_ver=""
+        command -v aws &>/dev/null && pre_ver=$(aws --version 2>&1 | grep -oE 'aws-cli/[0-9.]+' | cut -d/ -f2)
+
         if [[ "$(uname)" == "Darwin" ]]; then
           local pkg="/tmp/AWSCLIV2.pkg"
-          curl -fsSL "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "$pkg"
-          sudo installer -pkg "$pkg" -target / &>/dev/null
+          if ! curl -fSL "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "$pkg"; then
+            echo -e "    ${RED}${ERR}  Download failed (network / proxy issue?).${RST}"
+            rm -f "$pkg"; return 1
+          fi
+          if [[ ! -s "$pkg" ]]; then
+            echo -e "    ${RED}${ERR}  Downloaded pkg is empty.${RST}"; rm -f "$pkg"; return 1
+          fi
+          echo -e "    ${GRY}${ARW} Running installer (needs sudo)...${RST}"
+          if ! sudo installer -pkg "$pkg" -target /; then
+            echo -e "    ${RED}${ERR}  Installer failed. Try installing manually from the same URL.${RST}"
+            rm -f "$pkg"; return 1
+          fi
           rm -f "$pkg"
         else
-          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "$aws_zip"
-          unzip -q "$aws_zip" -d "$aws_dir"
-          sudo "${aws_dir}/aws/install" --update &>/dev/null
+          if ! curl -fSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "$aws_zip"; then
+            echo -e "    ${RED}${ERR}  Download failed (network / proxy issue?).${RST}"
+            rm -f "$aws_zip"; return 1
+          fi
+          if [[ ! -s "$aws_zip" ]]; then
+            echo -e "    ${RED}${ERR}  Downloaded zip is empty.${RST}"; rm -f "$aws_zip"; return 1
+          fi
+          if ! unzip -q -o "$aws_zip" -d "$aws_dir"; then
+            echo -e "    ${RED}${ERR}  Failed to extract installer zip.${RST}"
+            rm -rf "$aws_zip" "$aws_dir"; return 1
+          fi
+          echo -e "    ${GRY}${ARW} Running installer (needs sudo)...${RST}"
+          # --update is safe for first-install too
+          if ! sudo "${aws_dir}/aws/install" --update; then
+            echo -e "    ${RED}${ERR}  Installer failed. See output above.${RST}"
+            rm -rf "$aws_zip" "$aws_dir"; return 1
+          fi
           rm -rf "$aws_zip" "$aws_dir"
         fi
 
         if command -v aws &>/dev/null; then
-          echo -e "    ${GRN}${OK}  AWS CLI installed: $(aws --version 2>&1)${RST}"
+          local post_ver; post_ver=$(aws --version 2>&1 | grep -oE 'aws-cli/[0-9.]+' | cut -d/ -f2)
+          if [[ -n "$pre_ver" && "$pre_ver" == "$post_ver" ]]; then
+            echo -e "    ${YLW}${WRN}  Install ran but version unchanged (still v${post_ver}). Open a fresh shell and re-check.${RST}"
+            return 1
+          fi
+          echo -e "    ${GRN}${OK}  AWS CLI v${post_ver} installed.${RST}"
           return 0
         else
-          echo -e "    ${YLW}${WRN}  Installed but not found in PATH. Re-open your shell and re-run.${RST}"
+          echo -e "    ${YLW}${WRN}  Installed but 'aws' not on PATH. Re-open your shell and re-run.${RST}"
           return 1
         fi
 
@@ -195,7 +266,13 @@ with zipfile.ZipFile('${tf_zip}') as z:
             | sudo tee /etc/apt/sources.list.d/hashicorp.list &>/dev/null
           sudo apt-get update -qq && sudo apt-get install -y terraform &>/dev/null ;;
         aws)
-          echo -e "    ${GRY}${ARW} Installing AWS CLI via apt ...${RST}"
+          echo -e "    ${YLW}${WRN}  The 'awscli' apt package is AWS CLI v1 (deprecated).${RST}"
+          echo -e "    ${YLW}      v1 is missing many features needed by this wizard (SSO, IMDSv2 helpers, etc.).${RST}"
+          echo -e "    ${WHT}      Strongly recommended: choose 'download' instead -- it installs AWS CLI v2.${RST}"
+          if ! _yn_prompt "  Install v1 anyway via apt?"; then
+            echo -e "    ${GRY}      Skipping apt install. Re-run and pick 'download'.${RST}"
+            return 1
+          fi
           sudo apt-get update -qq && sudo apt-get install -y awscli &>/dev/null ;;
         python3)
           sudo apt-get update -qq && sudo apt-get install -y python3 &>/dev/null ;;
@@ -208,6 +285,12 @@ with zipfile.ZipFile('${tf_zip}') as z:
           sudo yum-config-manager --add-repo https://rpm.releases.hashicorp.com/RHEL/hashicorp.repo &>/dev/null
           sudo "$PKG_MGR" install -y terraform &>/dev/null ;;
         aws)
+          echo -e "    ${YLW}${WRN}  The 'awscli' ${PKG_MGR} package is AWS CLI v1 (deprecated).${RST}"
+          echo -e "    ${WHT}      Strongly recommended: choose 'download' instead -- it installs AWS CLI v2.${RST}"
+          if ! _yn_prompt "  Install v1 anyway via ${PKG_MGR}?"; then
+            echo -e "    ${GRY}      Skipping. Re-run and pick 'download'.${RST}"
+            return 1
+          fi
           sudo "$PKG_MGR" install -y awscli &>/dev/null ;;
         python3)
           sudo "$PKG_MGR" install -y python3 &>/dev/null ;;
@@ -321,13 +404,6 @@ for item in "aws:AWS_OK" "terraform:TERRAFORM_OK" "python3:PYTHON_OK"; do
   fi
 done
 
-# ── Inline yes/no prompt (the global confirm() is defined later) ──
-_yn_prompt() {
-  local msg="$1" ans
-  read -rp "  ${msg} [y/N]: " ans
-  [[ "$ans" =~ ^[Yy]$ ]]
-}
-
 # ── If Terraform is installed, check if it's outdated ────────
 if [[ "$TERRAFORM_OK" == "true" ]]; then
   installed_tf=$(terraform version -json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('terraform_version',''))" 2>/dev/null || echo "")
@@ -343,11 +419,27 @@ if [[ "$TERRAFORM_OK" == "true" ]]; then
   fi
 fi
 
-# ── Offer to refresh AWS CLI to latest v2 (Linux/macOS installer always pulls latest) ──
+# ── Fetch latest AWS CLI v2 version from GitHub tags API ─────
+fetch_latest_aws_cli_version() {
+  curl -fsSL "https://api.github.com/repos/aws/aws-cli/tags?per_page=1" 2>/dev/null \
+    | python3 -c "import sys,json; tags=json.load(sys.stdin); print(tags[0]['name'] if tags else '')" 2>/dev/null
+}
+
+# ── If AWS CLI is installed, check if it's outdated ──────────
 if [[ "$AWS_OK" == "true" ]]; then
   installed_aws=$(aws --version 2>&1 | grep -oE 'aws-cli/[0-9.]+' | cut -d/ -f2)
-  if [[ -n "$installed_aws" ]]; then
-    echo -e "  ${GRY}  AWS CLI v${installed_aws} detected. AWS does not publish a 'latest version' API; the official installer always delivers the newest v2.${RST}"
+  latest_aws=$(fetch_latest_aws_cli_version)
+  if [[ -n "$installed_aws" && -n "$latest_aws" ]] && semver_lt "$installed_aws" "$latest_aws"; then
+    echo ""
+    echo -e "  ${YLW}${WRN}  AWS CLI v${installed_aws} is installed -- latest is v${latest_aws}.${RST}"
+    if _yn_prompt "Upgrade AWS CLI to v${latest_aws}?"; then
+      install_tool "aws"
+    fi
+  elif [[ -n "$installed_aws" && -n "$latest_aws" ]]; then
+    echo -e "  ${GRN}${OK}  AWS CLI v${installed_aws} is up to date.${RST}"
+  elif [[ -n "$installed_aws" ]]; then
+    # Couldn't reach GitHub - fall back to manual offer
+    echo -e "  ${GRY}  AWS CLI v${installed_aws} detected (latest-version lookup unavailable).${RST}"
     if _yn_prompt "Pull latest AWS CLI v2 now?"; then
       install_tool "aws"
     fi
