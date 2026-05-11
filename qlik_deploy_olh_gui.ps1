@@ -10,6 +10,11 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# Force CWD to the script's own folder. UAC-elevated processes start in
+# C:\Windows\System32 by default; without this, terraform.tfvars and the
+# other wizard outputs would be written there (and likely fail with EACCES).
+if ($PSScriptRoot) { Set-Location -LiteralPath $PSScriptRoot }
+
 #region ── Script-Level State ─────────────────────────────────
 
 $script:State = @{
