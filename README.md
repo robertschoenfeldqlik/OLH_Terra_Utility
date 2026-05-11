@@ -39,14 +39,15 @@ chmod +x qlik_deploy_olh.sh
 
 | Tool | Version | Notes |
 |---|---|---|
-| AWS CLI v2 | latest | Wizard auto-installs from `awscli.amazonaws.com` |
-| Terraform | ≥ 1.5.0 | Wizard fetches latest from HashiCorp's releases API |
+| AWS CLI v2 | latest | Auto-installs from `awscli.amazonaws.com`; outdated detection via GitHub tags API |
+| Terraform | ≥ 1.5.0 | Wizard fetches latest from HashiCorp's releases API; floor 1.15.1 |
 | AWS provider | ≥ 5.80 | Pulled by `terraform init` (v6.43+ today) |
-| Python 3 | any | Bash wizard only |
-| PowerShell | 5.1+ | Windows GUI |
+| Python 3 | any | Bash wizard only; auto-detects `python3` / `python` / `py` |
+| PowerShell | 5.1+ | Windows GUI (launcher self-elevates for MSI install) |
 
-The wizard checks installed versions against the latest release and offers an
-in-place upgrade if you're behind.
+The wizard checks both installed versions against the latest release and
+offers an in-place upgrade if you're behind. The GUI button changes to
+`Update to vX.Y.Z...`; the bash wizard prompts `Upgrade ... to vX.Y.Z?`.
 
 ## Terraform layer
 
@@ -72,7 +73,7 @@ terraform init -backend=false
 terraform validate
 ```
 
-Confirmed against Terraform v1.14.6 + AWS provider v6.43.0.
+Confirmed against Terraform v1.15.0 + AWS provider v6.43.0.
 
 ## Documentation
 

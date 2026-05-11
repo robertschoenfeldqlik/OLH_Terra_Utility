@@ -53,6 +53,21 @@ _yn_prompt() {
   [[ "$ans" =~ ^[Yy]$ ]]
 }
 
+# ── Find a working Python 3 interpreter ───────────────────────
+# On Windows Git Bash, `python3` is often a Microsoft Store stub that
+# prints an install prompt and exits non-zero. Probe candidates and
+# pick the first that actually runs and reports Python 3.
+PY=""
+for candidate in python3 python py; do
+  if command -v "$candidate" &>/dev/null \
+     && "$candidate" -c "import sys; sys.exit(0 if sys.version_info[0]==3 else 1)" 2>/dev/null; then
+    PY="$candidate"
+    break
+  fi
+done
+# Single-arg helper: `py "import x; print(x.foo)"`
+py() { [[ -n "$PY" ]] && "$PY" -c "$1" 2>/dev/null || true; }
+
 # ── Detect OS package manager ─────────────────────────────────
 detect_pkg_manager() {
   if   command -v apt-get &>/dev/null; then echo "apt"
@@ -116,10 +131,10 @@ install_tool() {
         local tf_ver
         # Try official HashiCorp releases API first (most reliable), fall back to checkpoint API
         tf_ver=$(curl -fsSL "https://api.releases.hashicorp.com/v1/releases/terraform/latest" 2>/dev/null \
-          | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])" 2>/dev/null)
+          | "$PY" -c "import sys,json; print(json.load(sys.stdin)['version'])" 2>/dev/null)
         if [[ -z "$tf_ver" ]]; then
           tf_ver=$(curl -fsSL "https://checkpoint-api.hashicorp.com/v1/check/terraform" 2>/dev/null \
-            | python3 -c "import sys,json; print(json.load(sys.stdin)['current_version'])" 2>/dev/null)
+            | "$PY" -c "import sys,json; print(json.load(sys.stdin)['current_version'])" 2>/dev/null)
         fi
         # Fallback to a known-recent version if both APIs fail
         [[ -z "$tf_ver" ]] && tf_ver="1.15.1"
@@ -166,7 +181,7 @@ import zipfile, os, sys
 with zipfile.ZipFile('${tf_zip}') as z:
     z.extract('terraform', '${tf_dest}')
 PYEOF
-          if ! $sudo_cmd python3 "$extract_script"; then
+          if ! $sudo_cmd "$PY" "$extract_script"; then
             echo -e "    ${RED}${ERR}  Python extraction failed.${RST}"
             rm -f "$tf_zip" "$extract_script"; return 1
           fi
@@ -182,7 +197,7 @@ PYEOF
         esac
 
         if command -v terraform &>/dev/null; then
-          local ver; ver=$(terraform version -json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['terraform_version'])" 2>/dev/null || echo "$tf_ver")
+          local ver; ver=$(terraform version -json 2>/dev/null | "$PY" -c "import sys,json; print(json.load(sys.stdin)['terraform_version'])" 2>/dev/null || echo "$tf_ver")
           echo -e "    ${GRN}${OK}  Terraform v${ver} installed.${RST}"
           return 0
         else
@@ -372,15 +387,16 @@ check_tool() {
 fetch_latest_terraform_version() {
   local v
   v=$(curl -fsSL "https://api.releases.hashicorp.com/v1/releases/terraform/latest" 2>/dev/null \
-    | python3 -c "import sys,json; print(json.load(sys.stdin)['version'])" 2>/dev/null)
+    | "$PY" -c "import sys,json; print(json.load(sys.stdin)['version'])" 2>/dev/null)
   [[ -z "$v" ]] && v=$(curl -fsSL "https://checkpoint-api.hashicorp.com/v1/check/terraform" 2>/dev/null \
-    | python3 -c "import sys,json; print(json.load(sys.stdin)['current_version'])" 2>/dev/null)
+    | "$PY" -c "import sys,json; print(json.load(sys.stdin)['current_version'])" 2>/dev/null)
   echo "$v"
 }
 
 semver_lt() {
   # Returns 0 (true) if $1 < $2
-  python3 -c "
+  [[ -z "$PY" ]] && return 2
+  "$PY" -c "
 import sys
 def parse(v): return tuple(int(x) for x in v.strip().lstrip('v').split('.') if x.isdigit())
 sys.exit(0 if parse('$1') < parse('$2') else 1)
@@ -389,15 +405,28 @@ sys.exit(0 if parse('$1') < parse('$2') else 1)
 
 check_tool "aws"       "AWS CLI"   "YES"      "aws --version 2>&1 | head -1"  && AWS_OK=true
 check_tool "terraform" "Terraform" "optional" "terraform version 2>/dev/null | head -1" && TERRAFORM_OK=true
-check_tool "python3"   "Python 3"  "YES"      "python3 --version 2>&1"        && PYTHON_OK=true
+
+# Python check uses the detected PY (not the literal `python3` which on
+# Windows resolves to the Microsoft Store stub)
+if [[ -n "$PY" ]]; then
+  printf "  %-20s %-10s %-38s " "Python 3" "YES" "$("$PY" --version 2>&1)"
+  echo -e "${GRN}${OK}  Ready  (${PY})${RST}"
+  PYTHON_OK=true
+else
+  printf "  %-20s %-10s %-38s " "Python 3" "YES" "NOT FOUND"
+  echo -e "${YLW}${WRN}  Missing${RST}"
+fi
 
 echo "  $(printf '%0.s─' {1..75})"
 
 # ── Offer install for each missing tool ───────────────────────
+# Use the *_OK flags as the source of truth (not just `command -v ...`),
+# because on Windows Git Bash `command -v python3` returns 0 for the
+# Microsoft Store stub even though the stub doesn't actually run Python.
 for item in "aws:AWS_OK" "terraform:TERRAFORM_OK" "python3:PYTHON_OK"; do
   local_tool="${item%%:*}"
   local_var="${item##*:}"
-  if ! command -v "$local_tool" &>/dev/null; then
+  if [[ "$(eval echo \$$local_var)" != "true" ]]; then
     if install_tool "$local_tool"; then
       eval "$local_var=true"
     fi
@@ -406,7 +435,7 @@ done
 
 # ── If Terraform is installed, check if it's outdated ────────
 if [[ "$TERRAFORM_OK" == "true" ]]; then
-  installed_tf=$(terraform version -json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('terraform_version',''))" 2>/dev/null || echo "")
+  installed_tf=$(terraform version -json 2>/dev/null | "$PY" -c "import sys,json; print(json.load(sys.stdin).get('terraform_version',''))" 2>/dev/null || echo "")
   latest_tf=$(fetch_latest_terraform_version)
   if [[ -n "$installed_tf" && -n "$latest_tf" ]] && semver_lt "$installed_tf" "$latest_tf"; then
     echo ""
@@ -422,7 +451,7 @@ fi
 # ── Fetch latest AWS CLI v2 version from GitHub tags API ─────
 fetch_latest_aws_cli_version() {
   curl -fsSL "https://api.github.com/repos/aws/aws-cli/tags?per_page=1" 2>/dev/null \
-    | python3 -c "import sys,json; tags=json.load(sys.stdin); print(tags[0]['name'] if tags else '')" 2>/dev/null
+    | "$PY" -c "import sys,json; tags=json.load(sys.stdin); print(tags[0]['name'] if tags else '')" 2>/dev/null
 }
 
 # ── If AWS CLI is installed, check if it's outdated ──────────
@@ -556,7 +585,7 @@ tag_spec() {
 {Key=ManagedBy,Value=script}]"
 }
 
-py() { python3 -c "$1" 2>/dev/null || true; }
+# (py() is defined at the top of the script with the detected PY interpreter)
 
 #endregion
 
@@ -880,8 +909,8 @@ ACCT_ID="unknown"
 CALLER="unknown"
 IDENTITY=$(aws sts get-caller-identity --region "$REGION" --output json 2>/dev/null || true)
 if [[ -n "$IDENTITY" ]]; then
-  ACCT_ID=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")
-  CALLER=$(echo  "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")
+  ACCT_ID=$(echo "$IDENTITY" | "$PY" -c "import sys,json; print(json.load(sys.stdin)['Account'])")
+  CALLER=$(echo  "$IDENTITY" | "$PY" -c "import sys,json; print(json.load(sys.stdin)['Arn'])")
   echo -e "  ${GRN}${OK}  Authenticated : ${CALLER}${RST}"
   echo -e "  ${GRN}${OK}  Account ID    : ${ACCT_ID}${RST}"
 else
@@ -1011,11 +1040,11 @@ if $DRIFT_ONLY; then
 
   # Tag drift check on S3 iceberg bucket
   LIVE_OWNER=$(aws s3api get-bucket-tagging --bucket "${PREFIX}-iceberg-s3" 2>/dev/null | \
-    python3 -c "import sys,json; t={x['Key']:x['Value'] for x in json.load(sys.stdin)['TagSet']}; print(t.get('Owner','N/A'))" 2>/dev/null || echo "N/A")
+    "$PY" -c "import sys,json; t={x['Key']:x['Value'] for x in json.load(sys.stdin)['TagSet']}; print(t.get('Owner','N/A'))" 2>/dev/null || echo "N/A")
   check_drift "Tag: Owner" "$INITIALS" "$LIVE_OWNER"
 
   LIVE_ENV=$(aws s3api get-bucket-tagging --bucket "${PREFIX}-iceberg-s3" 2>/dev/null | \
-    python3 -c "import sys,json; t={x['Key']:x['Value'] for x in json.load(sys.stdin)['TagSet']}; print(t.get('Environment','N/A'))" 2>/dev/null || echo "N/A")
+    "$PY" -c "import sys,json; t={x['Key']:x['Value'] for x in json.load(sys.stdin)['TagSet']}; print(t.get('Environment','N/A'))" 2>/dev/null || echo "N/A")
   check_drift "Tag: Environment" "$ENV" "$LIVE_ENV"
 
   echo ""; echo -e "  ${GRN}Drift detection complete.${RST}"
