@@ -1642,7 +1642,10 @@ function Build-Step4 {
             $bn = $script:Controls[$bkt.CtrlName].Text
             if (-not $bn) { continue }
             $result = Invoke-AwsCmd "aws s3api head-bucket --bucket $bn --region $($script:State.Region)" -Silent
-            if ($result -ne $null -or $LASTEXITCODE -eq 0) {
+            # Invoke-AwsCmd returns $null on failure, "" on head-bucket success.
+            # Do NOT consult $LASTEXITCODE here -- it holds a stale value from
+            # whatever native command ran last and falsely reports "Exists".
+            if ($null -ne $result) {
                 $script:Controls[$bkt.StatusName].Text = "Exists"
                 $script:Controls[$bkt.StatusName].ForeColor = [System.Drawing.Color]::DarkGreen
             } else {
@@ -1958,6 +1961,19 @@ function Start-Deploy {
         Update-Progress 5 "Starting teardown..."
         Write-LogRed "  !! TEARDOWN: Destroying resources for $PREFIX"
 
+        # Read the ACTUAL resource names from terraform.tfvars when present --
+        # the user may have customized them during deployment; recomputing
+        # defaults from $PREFIX would miss (orphan) renamed resources.
+        $twTfvars = Join-Path $PWD "terraform.tfvars"
+        $twIceberg = "$PREFIX-iceberg-s3"; $twKinesis = "$PREFIX-stream-kinesis"
+        if (Test-Path $twTfvars) {
+            $twContent = Get-Content $twTfvars -Raw
+            if ($twContent -match 's3_bucket_name\s*=\s*"([^"]+)"')      { $twIceberg = $Matches[1] }
+            if ($twContent -match 'kinesis_stream_name\s*=\s*"([^"]+)"') { $twKinesis = $Matches[1] }
+        } else {
+            Write-LogYellow "  !!  terraform.tfvars not found -- using default names derived from prefix."
+        }
+
         if ($script:State.TerraformOk) {
             Update-Progress 15 "Running terraform destroy..."
             Write-LogGray "  -> terraform destroy -auto-approve -var-file=terraform.tfvars"
@@ -1965,12 +1981,25 @@ function Start-Deploy {
             $psi.FileName = "terraform"; $psi.Arguments = "destroy -auto-approve -var-file=terraform.tfvars"
             $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
             $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+            $psi.WorkingDirectory = $PWD.Path
             $proc = [System.Diagnostics.Process]::Start($psi)
+            # Drain both pipes asynchronously BEFORE WaitForExit -- terraform is
+            # verbose enough to fill the pipe buffer and deadlock otherwise.
+            $outTask = $proc.StandardOutput.ReadToEndAsync()
+            $errTask = $proc.StandardError.ReadToEndAsync()
             $proc.WaitForExit()
+            if ($proc.ExitCode -ne 0) {
+                $tfErr = $errTask.Result
+                Write-LogRed "  X  terraform destroy failed (exit $($proc.ExitCode))"
+                if ($tfErr) { Write-LogRed ("  " + (($tfErr.Trim() -split "`n" | Select-Object -First 8) -join "`n  ")) }
+            } else {
+                Write-LogGreen "  OK  terraform destroy complete"
+            }
+            $null = $outTask.Result
         }
 
         Update-Progress 40 "Removing S3 buckets..."
-        foreach ($bucket in @("$PREFIX-iceberg-s3","$PREFIX-landing-s3","$PREFIX-config-s3")) {
+        foreach ($bucket in @($twIceberg,"$PREFIX-landing-s3","$PREFIX-config-s3")) {
             Write-LogGray "  -> Emptying & deleting: $bucket"
             Invoke-AwsCmd "aws s3 rm s3://$bucket --recursive --region $($s.Region)" -Silent
             Invoke-AwsCmd "aws s3api delete-bucket --bucket $bucket --region $($s.Region)" -Silent
@@ -1978,8 +2007,8 @@ function Start-Deploy {
         }
 
         Update-Progress 60 "Removing Kinesis stream..."
-        Invoke-AwsCmd "aws kinesis delete-stream --stream-name $PREFIX-stream-kinesis --region $($s.Region)" -Silent
-        Write-LogGreen "  OK  Kinesis stream removed"
+        Invoke-AwsCmd "aws kinesis delete-stream --stream-name $twKinesis --region $($s.Region)" -Silent
+        Write-LogGreen "  OK  Kinesis stream removed ($twKinesis)"
 
         Update-Progress 80 "Removing IAM resources..."
         Invoke-AwsCmd "aws iam remove-role-from-instance-profile --instance-profile-name $PREFIX-instance-profile --role-name $PREFIX-ec2-role-iam" -Silent
@@ -2139,6 +2168,25 @@ function Start-Deploy {
             Write-LogGray "  Creating instance profile..."
             Invoke-AwsCmd "aws iam create-instance-profile --instance-profile-name `"$PREFIX-instance-profile`" --tags `"Key=Owner,Value=$($s.Initials)`" `"Key=Environment,Value=$($s.Environment)`" `"Key=CreateDate,Value=$($s.CreateDate)`"" -Silent
             Invoke-AwsCmd "aws iam add-role-to-instance-profile --instance-profile-name `"$PREFIX-instance-profile`" --role-name `"$PREFIX-ec2-role-iam`"" -Silent
+            $INSTANCE_PROFILE_ARN = "arn:aws:iam::${acctId}:instance-profile/$PREFIX-instance-profile"
+            Write-LogGreen "  OK  Created: $INSTANCE_PROFILE_ARN"
+        }
+    } elseif (-not $INSTANCE_PROFILE_ARN) {
+        # Existing role selected but no instance profile known: discover the
+        # profile attached to that role, or create one if the role has none.
+        $roleName = ($MGMT_ROLE_ARN -split '/')[-1]
+        Write-LogGray "  Looking up instance profile for role: $roleName"
+        $profJson = Invoke-AwsCmd "aws iam list-instance-profiles-for-role --role-name `"$roleName`" --output json" -AsJson -Silent
+        if ($profJson -and $profJson.InstanceProfiles -and $profJson.InstanceProfiles.Count -gt 0) {
+            $INSTANCE_PROFILE_ARN = $profJson.InstanceProfiles[0].Arn
+            Write-LogGreen "  OK  Found instance profile: $INSTANCE_PROFILE_ARN"
+        } elseif ($DryRun) {
+            $INSTANCE_PROFILE_ARN = "arn:aws:iam::${acctId}:instance-profile/$PREFIX-instance-profile-DRYRUN"
+            Write-LogYellow "  [DRY-RUN] Would create instance profile for existing role"
+        } else {
+            Write-LogGray "  Role has no instance profile -- creating one..."
+            Invoke-AwsCmd "aws iam create-instance-profile --instance-profile-name `"$PREFIX-instance-profile`" --tags `"Key=Owner,Value=$($s.Initials)`" `"Key=Environment,Value=$($s.Environment)`" `"Key=CreateDate,Value=$($s.CreateDate)`"" -Silent
+            Invoke-AwsCmd "aws iam add-role-to-instance-profile --instance-profile-name `"$PREFIX-instance-profile`" --role-name `"$roleName`"" -Silent
             $INSTANCE_PROFILE_ARN = "arn:aws:iam::${acctId}:instance-profile/$PREFIX-instance-profile"
             Write-LogGreen "  OK  Created: $INSTANCE_PROFILE_ARN"
         }
@@ -2379,8 +2427,10 @@ h1 small{font-size:12px;opacity:.8;display:block;margin-top:4px}
         $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
         $psi.WorkingDirectory = $PWD.Path
         $proc = [System.Diagnostics.Process]::Start($psi)
-        $tfOut = $proc.StandardOutput.ReadToEnd()
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
         $proc.WaitForExit()
+        $null = $outTask.Result
         if ($proc.ExitCode -eq 0) {
             Write-LogGreen "  OK  terraform init complete"
             Write-LogGray "  -> terraform plan"
@@ -2391,8 +2441,10 @@ h1 small{font-size:12px;opacity:.8;display:block;margin-top:4px}
             $psi2.UseShellExecute = $false; $psi2.CreateNoWindow = $true
             $psi2.WorkingDirectory = $PWD.Path
             $proc2 = [System.Diagnostics.Process]::Start($psi2)
-            $proc2.StandardOutput.ReadToEnd() | Out-Null
+            $outTask2 = $proc2.StandardOutput.ReadToEndAsync()
+            $errTask2 = $proc2.StandardError.ReadToEndAsync()
             $proc2.WaitForExit()
+            $null = $outTask2.Result
             if ($proc2.ExitCode -eq 0) {
                 Write-LogGreen "  OK  terraform plan saved to tfplan"
                 $r = [System.Windows.Forms.MessageBox]::Show("Terraform plan is ready. Apply now?", "Terraform Apply", 'YesNo', 'Question')
@@ -2404,13 +2456,27 @@ h1 small{font-size:12px;opacity:.8;display:block;margin-top:4px}
                     $psi3.UseShellExecute = $false; $psi3.CreateNoWindow = $true
                     $psi3.WorkingDirectory = $PWD.Path
                     $proc3 = [System.Diagnostics.Process]::Start($psi3)
-                    $proc3.StandardOutput.ReadToEnd() | Out-Null
+                    $outTask3 = $proc3.StandardOutput.ReadToEndAsync()
+                    $errTask3 = $proc3.StandardError.ReadToEndAsync()
                     $proc3.WaitForExit()
+                    $null = $outTask3.Result
                     if ($proc3.ExitCode -eq 0) { Write-LogGreen "  OK  terraform apply complete!" }
-                    else { Write-LogRed "  X  terraform apply failed" }
+                    else {
+                        Write-LogRed "  X  terraform apply failed (exit $($proc3.ExitCode))"
+                        $e3 = $errTask3.Result
+                        if ($e3) { Write-LogRed ("  " + (($e3.Trim() -split "`n" | Select-Object -First 8) -join "`n  ")) }
+                    }
                 }
-            } else { Write-LogRed "  X  terraform plan failed" }
-        } else { Write-LogRed "  X  terraform init failed" }
+            } else {
+                Write-LogRed "  X  terraform plan failed (exit $($proc2.ExitCode))"
+                $e2 = $errTask2.Result
+                if ($e2) { Write-LogRed ("  " + (($e2.Trim() -split "`n" | Select-Object -First 8) -join "`n  ")) }
+            }
+        } else {
+            Write-LogRed "  X  terraform init failed (exit $($proc.ExitCode))"
+            $e1 = $errTask.Result
+            if ($e1) { Write-LogRed ("  " + (($e1.Trim() -split "`n" | Select-Object -First 8) -join "`n  ")) }
+        }
     } elseif ($DryRun) {
         Write-LogYellow "  [DRY-RUN] Terraform steps skipped"
     } else {

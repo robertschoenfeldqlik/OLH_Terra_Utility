@@ -433,6 +433,24 @@ for item in "aws:AWS_OK" "terraform:TERRAFORM_OK" "python3:PYTHON_OK"; do
   fi
 done
 
+# ── Re-detect Python if it was just installed ─────────────────
+# $PY was probed at script start; a mid-run install leaves it empty, which
+# would silently break every JSON-parsing helper for the rest of the run.
+if [[ -z "$PY" && "$PYTHON_OK" == "true" ]]; then
+  for candidate in python3 python py; do
+    if command -v "$candidate" &>/dev/null \
+       && "$candidate" -c "import sys; sys.exit(0 if sys.version_info[0]==3 else 1)" 2>/dev/null; then
+      PY="$candidate"
+      echo -e "  ${GRN}${OK}  Python detected after install: ${PY}${RST}"
+      break
+    fi
+  done
+  if [[ -z "$PY" ]]; then
+    PYTHON_OK=false
+    echo -e "  ${YLW}${WRN}  Python installed but not usable in this shell yet -- re-open your shell and re-run.${RST}"
+  fi
+fi
+
 # ── If Terraform is installed, check if it's outdated ────────
 if [[ "$TERRAFORM_OK" == "true" ]]; then
   installed_tf=$(terraform version -json 2>/dev/null | "$PY" -c "import sys,json; print(json.load(sys.stdin).get('terraform_version',''))" 2>/dev/null || echo "")
@@ -772,6 +790,10 @@ case "$auth_sel" in
       else
         echo -e "  ${RED}${ERR}  SSO login failed.${RST}"
         echo -e "  ${GRY}      Verify your SSO configuration in ~/.aws/config${RST}"
+        # Without this guard the script would silently continue with whatever
+        # default credentials exist -- possibly deploying to the WRONG account.
+        confirm "  Continue with default/environment credentials instead?" || {
+          echo -e "  ${RED}Aborted.${RST}"; exit 1; }
       fi
     else
       echo -e "  ${YLW}${WRN}  No profile specified. Falling back to default credentials.${RST}"
@@ -916,7 +938,14 @@ if [[ -n "$IDENTITY" ]]; then
 else
   echo -e "  ${YLW}${WRN}  AWS CLI not authenticated.${RST}"
   echo -e "  ${GRY}      Check your credentials and try again.${RST}"
-  echo -e "  ${GRY}      Discovery steps requiring AWS calls will be skipped.${RST}"
+  if ! $DRY_RUN; then
+    # In LIVE mode an unknown account ID would poison every generated ARN
+    # (arn:aws:kms:<region>:unknown:key/...) and the tfvars file. Hard stop.
+    echo -e "  ${RED}${ERR}  Cannot continue a LIVE run without a verified AWS identity.${RST}"
+    echo -e "  ${GRY}      Re-run after fixing credentials, or use --dry-run to preview.${RST}"
+    exit 1
+  fi
+  echo -e "  ${YLW}      [DRY-RUN] Continuing with placeholder account ID.${RST}"
 fi
 
 echo -e "\n  ${GRN}Base prefix : ${PREFIX}${RST}"
@@ -1057,19 +1086,31 @@ if $TEARDOWN; then
   echo -e "  ${RED}${WRN}  This will permanently destroy all OLH resources for: ${PREFIX}${RST}\n"
   confirm "  Type 'y' to confirm teardown" || { echo "Aborted."; exit 0; }
 
+  # Read the ACTUAL resource names from terraform.tfvars when present.
+  # The user may have customized names during deployment -- recomputing
+  # defaults from PREFIX would orphan renamed resources.
+  TD_ICEBERG="${PREFIX}-iceberg-s3"
+  TD_KINESIS="${PREFIX}-stream-kinesis"
+  if [[ -f "terraform.tfvars" ]]; then
+    v=$(grep -E '^s3_bucket_name'      terraform.tfvars | cut -d'"' -f2 || true); [[ -n "$v" ]] && TD_ICEBERG="$v"
+    v=$(grep -E '^kinesis_stream_name' terraform.tfvars | cut -d'"' -f2 || true); [[ -n "$v" ]] && TD_KINESIS="$v"
+  else
+    echo -e "  ${YLW}${WRN}  terraform.tfvars not found -- using default names derived from prefix.${RST}"
+  fi
+
   echo -e "\n  ${GRY}${ARW} terraform destroy -auto-approve -var-file=terraform.tfvars${RST}"
   dry_exec "terraform destroy -auto-approve -var-file=terraform.tfvars"
 
   section "Removing resources not managed by Terraform"
-  for bucket in "${PREFIX}-iceberg-s3" "${PREFIX}-landing-s3" "${PREFIX}-config-s3"; do
+  for bucket in "${TD_ICEBERG}" "${PREFIX}-landing-s3" "${PREFIX}-config-s3"; do
     echo -e "  ${GRY}${ARW} Emptying and removing S3 bucket: ${bucket}${RST}"
     dry_exec "aws s3 rm s3://${bucket} --recursive --region ${REGION} 2>/dev/null || true"
     dry_exec "aws s3api delete-bucket --bucket ${bucket} --region ${REGION} 2>/dev/null || true"
     echo -e "  ${GRN}${OK}  Removed: ${bucket}${RST}"
   done
 
-  echo -e "  ${GRY}${ARW} Deleting Kinesis stream: ${PREFIX}-stream-kinesis${RST}"
-  dry_exec "aws kinesis delete-stream --stream-name ${PREFIX}-stream-kinesis --region ${REGION} 2>/dev/null || true"
+  echo -e "  ${GRY}${ARW} Deleting Kinesis stream: ${TD_KINESIS}${RST}"
+  dry_exec "aws kinesis delete-stream --stream-name ${TD_KINESIS} --region ${REGION} 2>/dev/null || true"
 
   echo -e "  ${GRY}${ARW} Removing instance profile role association${RST}"
   dry_exec "aws iam remove-role-from-instance-profile \

@@ -1,10 +1,10 @@
 # ── Naming / identity ────────────────────────────────────────────────────────
 variable "initials" {
-  description = "3-letter user / owner code used in resource names and the Owner tag."
+  description = "Owner code used in resource names and the Owner tag (2-6 lowercase alphanumeric, matching the wizard prompt)."
   type        = string
   validation {
-    condition     = can(regex("^[a-zA-Z]{2,5}$", var.initials))
-    error_message = "initials must be 2-5 alphabetic characters."
+    condition     = can(regex("^[a-z0-9]{2,6}$", var.initials))
+    error_message = "initials must be 2-6 lowercase alphanumeric characters (matches the wizard's input rule)."
   }
 }
 
@@ -14,11 +14,11 @@ variable "workload" {
 }
 
 variable "env" {
-  description = "Environment: dev | qa | prod."
+  description = "Environment: dev | uat | prod (the values the wizards offer); qa and stg also accepted for manual tfvars."
   type        = string
   validation {
-    condition     = contains(["dev", "qa", "stg", "prod"], var.env)
-    error_message = "env must be one of dev, qa, stg, prod."
+    condition     = contains(["dev", "uat", "qa", "stg", "prod"], var.env)
+    error_message = "env must be one of dev, uat, qa, stg, prod."
   }
 }
 
