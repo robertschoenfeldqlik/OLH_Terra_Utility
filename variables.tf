@@ -40,49 +40,88 @@ variable "aws_account_id" {
 variable "tfstate_bucket" {
   description = "S3 bucket holding remote Terraform state (configured via -backend-config at init time)."
   type        = string
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.tfstate_bucket))
+    error_message = "tfstate_bucket must be a valid S3 bucket name (3-63 chars, lowercase letters, digits, hyphens, dots)."
+  }
 }
 
 # ── Existing network ─────────────────────────────────────────────────────────
 variable "vpc_id" {
   description = "Existing VPC ID where OLH workloads run."
   type        = string
+  validation {
+    # Tolerates the DRYRUN placeholder (vpc-DRYRUN) while rejecting empty / wrong-resource values.
+    condition     = can(regex("^vpc-[a-zA-Z0-9]+$", var.vpc_id))
+    error_message = "vpc_id must look like vpc-xxxxxxxx (a VPC ID), not empty or another resource's ID."
+  }
 }
 
 variable "vpc_cidr" {
   description = "CIDR range of the VPC."
   type        = string
+  validation {
+    condition     = can(regex("^([0-9]{1,3}[.]){3}[0-9]{1,3}/[0-9]{1,2}$", var.vpc_cidr))
+    error_message = "vpc_cidr must be a CIDR block, e.g. 10.0.0.0/16."
+  }
 }
 
 variable "security_group_id" {
   description = "Existing Security Group attached to OLH compute (created by the wizard via aws cli)."
   type        = string
+  validation {
+    condition     = can(regex("^sg-[a-zA-Z0-9]+$", var.security_group_id))
+    error_message = "security_group_id must look like sg-xxxxxxxx, not empty or another resource's ID."
+  }
 }
 
 # ── Existing security / IAM ──────────────────────────────────────────────────
 variable "kms_key_arn" {
   description = "ARN of the symmetric KMS CMK used to encrypt OLH data."
   type        = string
+  validation {
+    condition     = can(regex("^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/.+$", var.kms_key_arn))
+    error_message = "kms_key_arn must be a KMS key ARN, e.g. arn:aws:kms:<region>:<account>:key/<id>."
+  }
 }
 
 variable "mgmt_role_arn" {
   description = "ARN of the IAM management role for the OLH control plane."
   type        = string
+  validation {
+    condition     = can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$", var.mgmt_role_arn))
+    error_message = "mgmt_role_arn must be an IAM role ARN, e.g. arn:aws:iam::<account>:role/<name>."
+  }
 }
 
 variable "instance_profile_arn" {
   description = "ARN of the IAM instance profile attached to OLH EC2 nodes."
   type        = string
+  validation {
+    # This is the field that previously slipped through empty and failed at the
+    # data-source lookup; reject anything that isn't an instance-profile ARN.
+    condition     = can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:instance-profile/.+$", var.instance_profile_arn))
+    error_message = "instance_profile_arn must be an IAM instance profile ARN, e.g. arn:aws:iam::<account>:instance-profile/<name>."
+  }
 }
 
 # ── Existing storage / streaming ─────────────────────────────────────────────
 variable "s3_bucket_name" {
   description = "Name of the primary S3 Iceberg data bucket."
   type        = string
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.s3_bucket_name))
+    error_message = "s3_bucket_name must be a valid S3 bucket name (3-63 chars, lowercase letters, digits, hyphens, dots)."
+  }
 }
 
 variable "kinesis_stream_name" {
   description = "Name of the Kinesis Data Stream used for CDC."
   type        = string
+  validation {
+    condition     = can(regex("^[a-zA-Z0-9_.-]{1,128}$", var.kinesis_stream_name))
+    error_message = "kinesis_stream_name must be 1-128 chars of letters, digits, underscores, dots, or hyphens."
+  }
 }
 
 variable "kinesis_shards" {
