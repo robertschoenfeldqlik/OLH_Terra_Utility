@@ -43,9 +43,39 @@ output "instance_profile_arn" {
   value       = data.aws_iam_instance_profile.olh.arn
 }
 
+output "node_role_arn" {
+  description = "IAM role the OLH EC2 nodes run as (carries the S3/Kinesis/KMS/Glue permissions)."
+  value       = data.aws_iam_role.node.arn
+}
+
+output "subnet_ids" {
+  description = "Subnets the lakehouse cluster runs in - at least two, across two AZs, all public."
+  value       = var.subnet_ids
+}
+
+output "subnet_azs" {
+  description = "Availability Zones spanned by those subnets."
+  value       = local.subnet_azs
+}
+
+output "s3_gateway_endpoint" {
+  description = "S3 gateway VPC endpoint serving the OLH subnets."
+  value       = local.s3_gateway_endpoint
+}
+
 output "s3_iceberg_bucket" {
   description = "Primary Iceberg S3 bucket name."
   value       = data.aws_s3_bucket.iceberg.bucket
+}
+
+output "s3_landing_bucket" {
+  description = "Landing bucket name."
+  value       = var.s3_landing_bucket
+}
+
+output "s3_config_bucket" {
+  description = "Config bucket name."
+  value       = var.s3_config_bucket
 }
 
 output "kinesis_stream_name" {
@@ -79,7 +109,13 @@ output "qtc_summary" {
     kms_key_arn          = data.aws_kms_key.olh.arn
     mgmt_role_arn        = data.aws_iam_role.mgmt.arn
     instance_profile_arn = data.aws_iam_instance_profile.olh.arn
+    node_role_arn        = data.aws_iam_role.node.arn
+    subnet_ids           = var.subnet_ids
+    subnet_azs           = local.subnet_azs
     s3_iceberg_bucket    = data.aws_s3_bucket.iceberg.bucket
+    s3_landing_bucket    = var.s3_landing_bucket
+    s3_config_bucket     = var.s3_config_bucket
+    s3_gateway_endpoint  = local.s3_gateway_endpoint
     kinesis_stream_arn   = data.aws_kinesis_stream.cdc.arn
     glue_database        = aws_glue_catalog_database.olh.name
     ssm_path             = local.ssm_path

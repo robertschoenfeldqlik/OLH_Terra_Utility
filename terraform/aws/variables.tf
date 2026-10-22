@@ -14,11 +14,11 @@ variable "workload" {
 }
 
 variable "env" {
-  description = "Environment: dev | uat | prod (the values the wizards offer); qa and stg also accepted for manual tfvars."
+  description = "Environment: dev | uat | prod (the values the wizards offer); qa, stg and mcg also accepted for manual tfvars."
   type        = string
   validation {
-    condition     = contains(["dev", "uat", "qa", "stg", "prod"], var.env)
-    error_message = "env must be one of dev, uat, qa, stg, prod."
+    condition     = contains(["dev", "uat", "qa", "stg", "prod", "mcg"], var.env)
+    error_message = "env must be one of dev, uat, qa, stg, prod, mcg."
   }
 }
 
@@ -124,12 +124,6 @@ variable "kinesis_stream_name" {
   }
 }
 
-variable "kinesis_shards" {
-  description = "Shard count for the Kinesis stream (informational; stream itself is referenced as a data source)."
-  type        = number
-  default     = 2
-}
-
 # ── Tags ─────────────────────────────────────────────────────────────────────
 variable "tag_owner" {
   description = "Owner tag value (typically the user's initials)."
@@ -150,4 +144,75 @@ variable "tag_workload" {
 variable "tag_createdate" {
   description = "CreateDate tag value (YYYY-MM-DD)."
   type        = string
+}
+
+# ── Qlik Talend Cloud tenant binding ─────────────────────────────────────────
+variable "qtc_external_id" {
+  description = "ExternalId issued by your Qlik Talend Cloud tenant. QTC presents this when it assumes the management role; the role's trust policy must require it."
+  type        = string
+  sensitive   = true
+  validation {
+    condition     = length(var.qtc_external_id) > 0
+    error_message = "qtc_external_id must be supplied - copy it from Administration > Network integrations in QTC."
+  }
+}
+
+variable "qlik_proxy_role_arn" {
+  description = "ARN of the Qlik-side principal allowed to assume the management role (the qlik-proxy-assume-role identity shown in QTC when you create the network integration)."
+  type        = string
+  validation {
+    condition     = can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:(role|user)/.+$", var.qlik_proxy_role_arn))
+    error_message = "qlik_proxy_role_arn must be an IAM role or user ARN, e.g. arn:aws:iam::<qlik-account>:role/qlik-proxy-assume-role."
+  }
+}
+
+variable "node_role_arn" {
+  description = "ARN of the IAM role attached to OLH EC2 nodes via the instance profile. Distinct from mgmt_role_arn: this one is trusted by ec2.amazonaws.com and carries the S3/Kinesis/KMS data-plane permissions."
+  type        = string
+  validation {
+    condition     = can(regex("^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+$", var.node_role_arn))
+    error_message = "node_role_arn must be an IAM role ARN, e.g. arn:aws:iam::<account>:role/<name>."
+  }
+}
+
+# ── Subnets ──────────────────────────────────────────────────────────────────
+variable "subnet_ids" {
+  description = "Subnets the lakehouse cluster runs in. OLH requires at least two, in two different Availability Zones, each public (route to an Internet Gateway, auto-assign public IP)."
+  type        = list(string)
+  validation {
+    condition     = length(var.subnet_ids) >= 2
+    error_message = "OLH requires at least two subnets in two different Availability Zones."
+  }
+  validation {
+    condition     = alltrue([for s in var.subnet_ids : can(regex("^subnet-[a-zA-Z0-9]+$", s))])
+    error_message = "every entry in subnet_ids must look like subnet-xxxxxxxx."
+  }
+}
+
+variable "s3_landing_bucket" {
+  description = "Landing bucket the lakehouse cluster stages incoming data in."
+  type        = string
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.s3_landing_bucket))
+    error_message = "s3_landing_bucket must be a valid S3 bucket name."
+  }
+}
+
+variable "s3_config_bucket" {
+  description = "Config bucket the lakehouse cluster keeps runtime configuration in."
+  type        = string
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.s3_config_bucket))
+    error_message = "s3_config_bucket must be a valid S3 bucket name."
+  }
+}
+
+variable "s3_gateway_endpoint_id" {
+  description = "Existing S3 gateway VPC endpoint to reuse. Leave empty and Terraform creates one - AWS permits only a single gateway endpoint per VPC per service, so set this if the VPC already has one."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.s3_gateway_endpoint_id == "" || can(regex("^vpce-[a-zA-Z0-9]+$", var.s3_gateway_endpoint_id))
+    error_message = "s3_gateway_endpoint_id must be empty or look like vpce-xxxxxxxx."
+  }
 }

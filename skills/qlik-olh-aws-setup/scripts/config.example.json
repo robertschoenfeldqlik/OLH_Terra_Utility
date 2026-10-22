@@ -1,0 +1,27 @@
+{
+  "prefix": "abc-olh-demo",
+  "owner": "abc",
+  "environment": "demo",
+  "region": "us-east-1",
+  "vpc_cidr": "10.42.0.0/16",
+  "subnets": [
+    {"cidr": "10.42.1.0/24", "az": "us-east-1a"},
+    {"cidr": "10.42.2.0/24", "az": "us-east-1b"}
+  ],
+
+  "qlik_proxy_role_arn": "arn:aws:iam::338144066592:role/qlik-proxy-assume-role",
+  "qtc_external_id": "<copy from the Management role 'Configuration guide' on the Qlik form>",
+
+  "extra_buckets": ["iceberg", "landing"],
+  "create_kinesis": false,
+  "managed_by": "qlik-olh-aws-setup",
+
+  "tenant": "<tenant>.us.qlikcloud.com",
+  "integration_name": "abc-olh-demo",
+  "space_name": "<Qlik space name>",
+  "space_id": "<from GET /api/v1/spaces?name=...>",
+  "cluster_name": "abc-olh-demo-cluster",
+  "cluster_capability": "cdc",
+  "rollout": "early",
+  "cluster_tags": {"Name": "abc-olh-demo-cluster", "Workload": "abc-olh-demo"}
+}

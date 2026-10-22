@@ -1,0 +1,44 @@
+{
+  "providerType": "aws",
+  "networkIntegrationName": "abc-olh-demo",
+  "spaceId": "<space-id>",
+  "awsAccount": "123456789012",
+  "symmetricKmsKey": "arn:aws:kms:us-east-1:123456789012:key/00000000-0000-0000-0000-000000000000",
+  "bucketName": "abc-olh-demo-config-s3",
+  "defaultManagementRole": "arn:aws:iam::123456789012:role/abc-olh-demo-mgmt-role-iam",
+  "defaultDataAccessRole": "arn:aws:iam::123456789012:instance-profile/abc-olh-demo-instance-profile",
+  "region": "us-east-1",
+  "vpcId": "vpc-0123456789abcdef0",
+  "keyPairName": null,
+  "useProxy": false,
+  "clusterName": "abc-olh-demo-cluster",
+  "clusterSpaceId": "<space-id>",
+  "clusterCapabilities": "database",
+  "useCustomImage": false,
+  "rolloutPhaseType": "early-rollout",
+  "subnetIds": [
+    {
+      "availabilityZone": "a",
+      "subnet": "subnet-0aaaaaaaaaaaaaaaa"
+    },
+    {
+      "availabilityZone": "b",
+      "subnet": "subnet-0bbbbbbbbbbbbbbbb"
+    }
+  ],
+  "securityGroupIds": [
+    {
+      "securityGroupId": "sg-0123456789abcdef0"
+    }
+  ],
+  "tags": [
+    {
+      "key": "Name",
+      "value": "abc-olh-demo-cluster"
+    },
+    {
+      "key": "Workload",
+      "value": "abc-olh-demo"
+    }
+  ]
+}

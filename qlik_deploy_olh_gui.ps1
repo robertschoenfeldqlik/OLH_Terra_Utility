@@ -15,10 +15,18 @@ Add-Type -AssemblyName System.Drawing
 # other wizard outputs would be written there (and likely fail with EACCES).
 if ($PSScriptRoot) { Set-Location -LiteralPath $PSScriptRoot }
 
+# Everything the wizard writes is resolved against this rather than the CWD,
+# which a user can change out from under a running form.
+$script:ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+
 #region ── Script-Level State ─────────────────────────────────
 
 $script:State = @{
     Mode             = "Deploy"
+    # Target cloud: "aws" (GA) or "gcp" (Private Preview, opened 2 Sep 2026).
+    Cloud            = "aws"
+    GcloudOk         = $false
+    GcloudVersion    = ""
     AwsCliOk         = $false
     AwsCliVersion    = ""
     TerraformOk      = $false
@@ -47,7 +55,6 @@ $script:State = @{
     RoleList         = @()
     InstanceProfileArn = ""
     CreateNewKms     = $false
-    CreateNewRole    = $false
     S3Iceberg        = ""
     S3Landing        = ""
     S3Config         = ""
@@ -62,6 +69,45 @@ $script:State = @{
     AwsSecretKey     = ""
     AwsSessionToken  = ""
     SsoProfile       = ""
+
+    # ── QTC tenant binding (AWS) ──
+    # The management role's trust policy is built from these. Without them QTC
+    # has nothing it can assume and the network integration never connects.
+    QtcExternalId      = ""
+    QlikProxyRoleArn   = ""
+    NodeRoleArn        = ""
+    S3GatewayEndpoint  = ""
+
+    # ── Google Cloud ──
+    GcpAuthMethod    = "current"          # current | login | keyfile
+    GcpKeyFile       = ""
+    GcpProjectId     = ""
+    GcpProjectNumber = ""
+    GcpProjectList   = @()
+    GcpZones         = @()
+    GcpAuthenticated = $false
+    GcpAccount       = ""
+    NetworkName      = ""
+    NetworkList      = @()
+    SubnetworkName   = ""
+    SubnetworkCidr   = ""
+    SubnetworkList   = @()
+    PrivateGoogleAccess = $false
+    FirewallRule     = ""
+    NatRouter        = ""
+    NatName          = ""
+    GcpKmsKeyId      = ""
+    GcpKmsKeyRing    = ""
+    GcpKmsKeyName    = ""
+    MgmtServiceAccount = ""
+    NodeServiceAccount = ""
+    GcsTable         = ""
+    GcsLanding       = ""
+    GcsConfig        = ""
+    GcsTfState       = ""
+    QtcTenantId      = ""
+    QtcAuthMethod    = "workload_identity" # workload_identity | preauthorized_sa
+    QtcOidcIssuer    = "https://auth.qlik.com/oauth/token"
 }
 
 $script:Controls = @{}
@@ -147,11 +193,34 @@ function Build-TagSpec {
     return "ResourceType=$Type,Tags=[{$($tags.Trim() -replace ' ','},{' )}]"
 }
 
+function Get-CloudLabel {
+    if ($script:State.Cloud -eq "gcp") { return "Google Cloud" } else { return "AWS" }
+}
+
+function Get-TerraformDir {
+    # Each cloud has its own Terraform root module: they need different
+    # backends (S3 vs GCS) and Terraform allows only one backend per config.
+    $sub = if ($script:State.Cloud -eq "gcp") { "gcp" } else { "aws" }
+    return (Join-Path $script:ScriptDir (Join-Path "terraform" $sub))
+}
+
+function Build-GcpLabels {
+    # GCP labels are stricter than AWS tags: lowercase letters, digits,
+    # hyphens and underscores only.
+    $s = $script:State
+    return "owner=$($s.Initials),environment=$($s.Environment),workload=qlik-olh,application=open-lakehouse,createdate=$($s.CreateDate),managedby=script"
+}
+
+function Invoke-GcloudCmd {
+    # Thin alias over Invoke-AwsCmd, which is really just "run this exe and
+    # give me stdout". Kept separate so GCP call sites read clearly.
+    param([string]$Command, [switch]$AsJson, [switch]$Silent)
+    return (Invoke-AwsCmd -Command $Command -AsJson:$AsJson -Silent:$Silent)
+}
+
 function Invoke-AwsCmd {
     param([string]$Command, [switch]$AsJson, [switch]$Silent)
     if (-not $Silent) { Write-LogGray "  -> $Command" }
-    $tmpOut = [System.IO.Path]::GetTempFileName()
-    $tmpErr = [System.IO.Path]::GetTempFileName()
     try {
         $parts = $Command -split ' ', 2
         $exe   = $parts[0]
@@ -183,8 +252,6 @@ function Invoke-AwsCmd {
     } catch {
         if (-not $Silent) { Write-LogRed "  !! Error: $_" }
         return $null
-    } finally {
-        Remove-Item $tmpOut, $tmpErr -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -366,6 +433,8 @@ function Test-VersionOutdated {
 }
 
 function Run-ToolCheck {
+    if ($script:State.Cloud -eq "gcp") { Run-ToolCheckGcp; return }
+
     # AWS CLI check
     $awsFound = [bool](Get-Command "aws" -ErrorAction SilentlyContinue)
     $script:State.AwsCliOk = $awsFound
@@ -431,6 +500,98 @@ function Run-ToolCheck {
     else           { Write-LogRed   "  X   AWS CLI not found - required!" }
     if ($tfFound)  { Write-LogGreen "  OK  Terraform: $($script:State.TerraformVersion)" }
     else           { Write-LogYellow "  !!  Terraform not found - deploy steps will be skipped" }
+}
+
+function Run-ToolCheckGcp {
+    # gcloud check. Unlike the AWS CLI there is no GitHub tag to compare
+    # against - gcloud carries its own updater - so we report the version and
+    # leave updating to "gcloud components update".
+    $gFound = [bool](Get-Command "gcloud" -ErrorAction SilentlyContinue)
+    $script:State.GcloudOk = $gFound
+    $script:State.AwsCliOk = $true   # not required on this path; keeps Validate-Step 0 simple
+
+    if ($gFound) {
+        $gVer = $null
+        try {
+            $raw = (gcloud version 2>&1) -join " "
+            if ($raw -match 'Google Cloud SDK ([\d\.]+)') { $gVer = $Matches[1] }
+        } catch { }
+        $v = if ($gVer) { "v$gVer" } else { "found" }
+        $script:State.GcloudVersion = $v
+        $script:Controls['lblAwsStatus'].Text = "[OK]  Google Cloud CLI - $v"
+        $script:Controls['lblAwsStatus'].ForeColor = [System.Drawing.Color]::DarkGreen
+        $script:Controls['btnInstallAws'].Text    = "Reinstall gcloud..."
+        $script:Controls['btnInstallAws'].Visible = $true
+    } else {
+        $script:State.GcloudVersion = ""
+        $script:Controls['lblAwsStatus'].Text = "[ X ]  Google Cloud CLI - NOT FOUND (required)"
+        $script:Controls['lblAwsStatus'].ForeColor = [System.Drawing.Color]::Red
+        $script:Controls['btnInstallAws'].Text    = "Install gcloud..."
+        $script:Controls['btnInstallAws'].Visible = $true
+    }
+
+    # Terraform check is identical on both clouds.
+    $tfFound = [bool](Get-Command "terraform" -ErrorAction SilentlyContinue)
+    $script:State.TerraformOk = $tfFound
+    if ($tfFound) {
+        try { $tfInstalled = (terraform version -json 2>$null | ConvertFrom-Json).terraform_version } catch { $tfInstalled = $null }
+        $v = if ($tfInstalled) { "v$tfInstalled" } else { "found" }
+        $script:State.TerraformVersion = $v
+        $tfLatest = Get-LatestTerraformVersion
+        if ($tfLatest -and $tfInstalled -and (Test-VersionOutdated $tfInstalled $tfLatest)) {
+            $script:Controls['lblTfStatus'].Text = "[ ! ]  Terraform - $v installed, latest is v$tfLatest"
+            $script:Controls['lblTfStatus'].ForeColor = [System.Drawing.Color]::FromArgb(180,130,0)
+            $script:Controls['btnInstallTf'].Text    = "Update to v$tfLatest..."
+        } else {
+            $latestNote = if ($tfLatest) { " (latest: v$tfLatest)" } else { "" }
+            $script:Controls['lblTfStatus'].Text = "[OK]  Terraform - $v$latestNote"
+            $script:Controls['lblTfStatus'].ForeColor = [System.Drawing.Color]::DarkGreen
+            $script:Controls['btnInstallTf'].Text    = "Reinstall Terraform..."
+        }
+        $script:Controls['btnInstallTf'].Visible = $true
+    } else {
+        $script:Controls['lblTfStatus'].Text = "[ ! ]  Terraform - not found (optional)"
+        $script:Controls['lblTfStatus'].ForeColor = [System.Drawing.Color]::FromArgb(180,130,0)
+        $script:Controls['btnInstallTf'].Text    = "Install Terraform..."
+        $script:Controls['btnInstallTf'].Visible = $true
+    }
+
+    Write-LogGreen "  Tool check complete."
+    if ($gFound) { Write-LogGreen "  OK  gcloud: $($script:State.GcloudVersion)" }
+    else         { Write-LogRed   "  X   Google Cloud CLI not found - required!" }
+    if ($tfFound) { Write-LogGreen "  OK  Terraform: $($script:State.TerraformVersion)" }
+    else          { Write-LogYellow "  !!  Terraform not found - deploy steps will be skipped" }
+}
+
+function Install-GcloudSdk {
+    # Google ships a Windows installer; run it interactively so the user keeps
+    # control of install location and PATH changes.
+    $url = "https://dl.google.com/dl/cloudsdk/channels/rapid/GoogleCloudSDKInstaller.exe"
+    $dest = Join-Path $env:TEMP "GoogleCloudSDKInstaller.exe"
+    Write-LogCyan "  Downloading Google Cloud CLI installer..."
+    Write-LogGray  "  -> $url"
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+    } catch {
+        Write-LogRed "  !! Download failed: $_"
+        [System.Windows.Forms.MessageBox]::Show(
+            "Could not download the installer. Install manually from:`n`nhttps://cloud.google.com/sdk/docs/install",
+            "Download failed", 'OK', 'Error') | Out-Null
+        return
+    }
+    Write-LogGreen "  Downloaded. Launching installer..."
+    try {
+        Start-Process -FilePath $dest -Wait
+    } catch {
+        Write-LogRed "  !! Could not start the installer: $_"
+        return
+    }
+    # The installer edits PATH for new processes; refresh ours so the tool
+    # check can see gcloud without a restart.
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
+                [System.Environment]::GetEnvironmentVariable("Path","User")
+    Run-ToolCheck
 }
 
 function Show-InstallDialog {
@@ -737,13 +898,52 @@ function Build-Step0 {
     $p = New-Object System.Windows.Forms.Panel
     $p.Dock = 'Fill'
 
-    $p.Controls.Add((New-Label "Welcome to Qlik Open Lakehouse Deployment Wizard" 20 10 720 30 -Bold -FontSize 12))
-    $p.Controls.Add((New-Label "This wizard will guide you through discovering and provisioning AWS resources for Qlik's Open Lakehouse architecture." 20 45 720 35))
+    $p.Controls.Add((New-Label "Welcome to Qlik Open Lakehouse Deployment Wizard" 20 8 720 26 -Bold -FontSize 12))
+
+    # ── Target cloud ──
+    # Asked first, because it decides which CLI the tool check demands and
+    # which set of wizard pages follows.
+    $grpCloud = New-Object System.Windows.Forms.GroupBox
+    $grpCloud.Text     = "Target Cloud"
+    $grpCloud.Location = [System.Drawing.Point]::new(20, 38)
+    $grpCloud.Size     = [System.Drawing.Size]::new(720, 76)
+
+    $rbAws = New-Object System.Windows.Forms.RadioButton
+    $rbAws.Text = "Amazon Web Services"; $rbAws.Location = [System.Drawing.Point]::new(15, 24)
+    $rbAws.Size = [System.Drawing.Size]::new(180, 22); $rbAws.Checked = $true
+    $rbAws.Add_CheckedChanged({ if ($this.Checked) { Set-Cloud "aws" } })
+    $script:Controls['rbCloudAws'] = $rbAws
+    $grpCloud.Controls.Add($rbAws)
+
+    $lblAwsGa = New-Label "generally available" 200 26 130
+    $lblAwsGa.ForeColor = [System.Drawing.Color]::Gray
+    $lblAwsGa.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $grpCloud.Controls.Add($lblAwsGa)
+
+    $rbGcp = New-Object System.Windows.Forms.RadioButton
+    $rbGcp.Text = "Google Cloud"; $rbGcp.Location = [System.Drawing.Point]::new(360, 24)
+    $rbGcp.Size = [System.Drawing.Size]::new(140, 22)
+    $rbGcp.Add_CheckedChanged({ if ($this.Checked) { Set-Cloud "gcp" } })
+    $script:Controls['rbCloudGcp'] = $rbGcp
+    $grpCloud.Controls.Add($rbGcp)
+
+    $lblGcpPrev = New-Label "Private Preview" 505 26 130
+    $lblGcpPrev.ForeColor = [System.Drawing.Color]::FromArgb(180,130,0)
+    $lblGcpPrev.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
+    $grpCloud.Controls.Add($lblGcpPrev)
+
+    $lblCloudNote = New-Label "" 15 48 690 20
+    $lblCloudNote.ForeColor = [System.Drawing.Color]::Gray
+    $lblCloudNote.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $script:Controls['lblCloudNote'] = $lblCloudNote
+    $grpCloud.Controls.Add($lblCloudNote)
+
+    $p.Controls.Add($grpCloud)
 
     # Tool Status GroupBox - full width for better readability
     $grpTools = New-Object System.Windows.Forms.GroupBox
     $grpTools.Text     = "Prerequisite Tools"
-    $grpTools.Location = [System.Drawing.Point]::new(20, 85)
+    $grpTools.Location = [System.Drawing.Point]::new(20, 120)
     $grpTools.Size     = [System.Drawing.Size]::new(720, 140)
 
     # AWS CLI row
@@ -752,7 +952,9 @@ function Build-Step0 {
     $script:Controls['lblAwsStatus'] = $lblAws
     $grpTools.Controls.Add($lblAws)
 
-    $btnInstAws = New-Btn "Install AWS CLI..." 490 25 120 26 { Show-InstallDialog "AWS CLI" }
+    $btnInstAws = New-Btn "Install AWS CLI..." 490 25 120 26 {
+        if ($script:State.Cloud -eq "gcp") { Install-GcloudSdk } else { Show-InstallDialog "AWS CLI" }
+    }
     $btnInstAws.Visible = $false
     $script:Controls['btnInstallAws'] = $btnInstAws
     $grpTools.Controls.Add($btnInstAws)
@@ -772,12 +974,20 @@ function Build-Step0 {
     $btnCheck = New-Btn "Check Tools" 15 95 120 30 { Run-ToolCheck }
     $grpTools.Controls.Add($btnCheck)
 
-    $lblCheckHint = New-Label "Verifies AWS CLI and Terraform are installed and on PATH" 145 100 400
+    $lblCheckHint = New-Label "Verifies the cloud CLI and Terraform are installed and on PATH" 145 100 400
     $lblCheckHint.ForeColor = [System.Drawing.Color]::Gray
     $lblCheckHint.Font = New-Object System.Drawing.Font("Segoe UI", 8)
     $grpTools.Controls.Add($lblCheckHint)
 
     $btnInstBoth = New-Btn "Install Both..." 620 95 90 30 {
+        if ($script:State.Cloud -eq "gcp") {
+            if (-not $script:State.GcloudOk) { Install-GcloudSdk }
+            if (-not $script:State.TerraformOk) { Show-InstallDialog "Terraform" }
+            if ($script:State.GcloudOk -and $script:State.TerraformOk) {
+                [System.Windows.Forms.MessageBox]::Show("Both tools are already installed.", "Info", 'OK', 'Information') | Out-Null
+            }
+            return
+        }
         if (-not $script:State.AwsCliOk) { Show-InstallDialog "AWS CLI" }
         if (-not $script:State.TerraformOk) { Show-InstallDialog "Terraform" }
         if ($script:State.AwsCliOk -and $script:State.TerraformOk) {
@@ -791,7 +1001,7 @@ function Build-Step0 {
     # Mode GroupBox
     $grpMode = New-Object System.Windows.Forms.GroupBox
     $grpMode.Text     = "Deployment Mode"
-    $grpMode.Location = [System.Drawing.Point]::new(20, 235)
+    $grpMode.Location = [System.Drawing.Point]::new(20, 266)
     $grpMode.Size     = [System.Drawing.Size]::new(720, 100)
 
     $rbDeploy = New-Object System.Windows.Forms.RadioButton
@@ -810,6 +1020,7 @@ function Build-Step0 {
     $rbDrift.Text = "Drift Check"; $rbDrift.Location = [System.Drawing.Point]::new(360, 25)
     $rbDrift.Size = [System.Drawing.Size]::new(130, 22)
     $rbDrift.Add_CheckedChanged({ if ($this.Checked) { $script:State.Mode = "Drift" } })
+    $script:Controls['rbModeDrift'] = $rbDrift
     $grpMode.Controls.Add($rbDrift)
 
     $rbTear = New-Object System.Windows.Forms.RadioButton
@@ -823,6 +1034,8 @@ function Build-Step0 {
             $script:Controls['lblTeardownWarn'].Visible = $false
         }
     })
+    $script:Controls['rbModeTeardown'] = $rbTear
+    $script:Controls['rbModeDeploy']   = $rbDeploy
     $grpMode.Controls.Add($rbTear)
 
     $lblWarn = New-Label "WARNING: Resources will be permanently deleted!" 15 55 690 22
@@ -1554,13 +1767,12 @@ function Build-Step3 {
     $p = New-Object System.Windows.Forms.Panel
     $p.Dock = 'Fill'
 
-    $p.Controls.Add((New-Label "Security and Encryption" 20 5 720 28 -Bold -FontSize 11))
+    $p.Controls.Add((New-Label "Security, Identity and Tenant Binding" 20 5 720 26 -Bold -FontSize 11))
 
-    # KMS Section
-    $p.Controls.Add((New-Label "KMS Symmetric Key" 20 40 300 22 -Bold))
-    $p.Controls.Add((& { $l = New-Label "Select an existing KMS key or create a new one for resource encryption." 20 62 720; $l.ForeColor = [System.Drawing.Color]::Gray; $l }))
+    # ── KMS ──
+    $p.Controls.Add((New-Label "KMS Symmetric Key" 20 34 300 22 -Bold))
 
-    $cboKms = New-ComboBox "cboKms" 20 90 480
+    $cboKms = New-ComboBox "cboKms" 20 58 480
     $cboKms.Add_SelectedIndexChanged({
         if ($this.SelectedIndex -ge 0 -and $script:State.KmsList.Count -gt $this.SelectedIndex) {
             $sel = $script:State.KmsList[$this.SelectedIndex]
@@ -1569,7 +1781,7 @@ function Build-Step3 {
     })
     $p.Controls.Add($cboKms)
 
-    $btnRefKms = New-Btn "Refresh" 510 89 80 26 {
+    $btnRefKms = New-Btn "Refresh" 510 57 80 26 {
         Write-LogGray "  Discovering KMS keys..."
         $raw = Invoke-AwsCmd "aws kms list-aliases --region $($script:State.Region) --query `"Aliases[?contains(AliasName,'$($script:State.Prefix)')].{Alias:AliasName,KeyId:TargetKeyId}`" --output json" -AsJson -Silent
         $cbo = $script:Controls['cboKms']
@@ -1586,61 +1798,53 @@ function Build-Step3 {
     $p.Controls.Add($btnRefKms)
 
     $chkNewKms = New-Object System.Windows.Forms.CheckBox
-    $chkNewKms.Text = "Create New"; $chkNewKms.Location = [System.Drawing.Point]::new(600, 92); $chkNewKms.Size = [System.Drawing.Size]::new(110, 22)
+    $chkNewKms.Text = "Create New"; $chkNewKms.Location = [System.Drawing.Point]::new(600, 60); $chkNewKms.Size = [System.Drawing.Size]::new(110, 22)
     $chkNewKms.Add_CheckedChanged({
         $script:State.CreateNewKms = $this.Checked
         $script:Controls['cboKms'].Enabled = -not $this.Checked
     })
     $p.Controls.Add($chkNewKms)
 
-    # IAM Role Section
-    $p.Controls.Add((New-Sep 20 130 720))
-    $p.Controls.Add((New-Label "IAM Management Role" 20 145 300 22 -Bold))
-    $p.Controls.Add((& { $l = New-Label "EC2 trust policy role for instance management. SSM Core policy auto-attached." 20 167 720; $l.ForeColor = [System.Drawing.Color]::Gray; $l }))
+    # ── IAM roles ──
+    $p.Controls.Add((New-Sep 20 94 720))
+    $p.Controls.Add((New-Label "IAM Roles" 20 104 300 22 -Bold))
 
-    $cboRole = New-ComboBox "cboRole" 20 195 480
-    $cboRole.Add_SelectedIndexChanged({
-        if ($this.SelectedIndex -ge 0 -and $script:State.RoleList.Count -gt $this.SelectedIndex) {
-            $script:State.MgmtRoleArn = $script:State.RoleList[$this.SelectedIndex].Arn
-        }
-    })
-    $p.Controls.Add($cboRole)
+    $lblRoles = New-Label "Two roles are created. The management role is assumed by Qlik from outside your account and carries the ExternalId condition below; the node role is assumed by EC2, goes into the instance profile, and gets the S3/Kinesis/KMS/Glue policy from Terraform." 20 126 720 44
+    $lblRoles.ForeColor = [System.Drawing.Color]::Gray
+    $lblRoles.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lblRoles)
 
-    $btnRefRole = New-Btn "Refresh" 510 194 80 26 {
-        Write-LogGray "  Discovering IAM roles..."
-        $raw = Invoke-AwsCmd "aws iam list-roles --query `"Roles[?contains(RoleName,'$($script:State.Prefix)')].{Name:RoleName,Arn:Arn}`" --output json" -AsJson -Silent
-        $cbo = $script:Controls['cboRole']
-        $cbo.Items.Clear()
-        $script:State.RoleList = @()
-        if ($raw) {
-            $script:State.RoleList = @($raw)
-            foreach ($r in $raw) { $cbo.Items.Add("$($r.Name)  |  $($r.Arn)") | Out-Null }
-            Write-LogGreen "  Found $($raw.Count) IAM role(s) matching prefix"
-        } else {
-            Write-LogYellow "  No IAM roles found with prefix $($script:State.Prefix)"
-        }
-    }
-    $p.Controls.Add($btnRefRole)
+    $lblRoleNames = New-Label "" 20 172 720 22
+    $lblRoleNames.ForeColor = [System.Drawing.Color]::FromArgb(25, 66, 104)
+    $lblRoleNames.Font = New-Object System.Drawing.Font("Consolas", 8.5)
+    $script:Controls['lblRoleNames'] = $lblRoleNames
+    $p.Controls.Add($lblRoleNames)
 
-    $chkNewRole = New-Object System.Windows.Forms.CheckBox
-    $chkNewRole.Text = "Create New"; $chkNewRole.Location = [System.Drawing.Point]::new(600, 197); $chkNewRole.Size = [System.Drawing.Size]::new(110, 22)
-    $chkNewRole.Add_CheckedChanged({
-        $script:State.CreateNewRole = $this.Checked
-        $script:Controls['cboRole'].Enabled = -not $this.Checked
-    })
-    $p.Controls.Add($chkNewRole)
+    # ── QTC tenant binding ──
+    $p.Controls.Add((New-Sep 20 200 720))
+    $p.Controls.Add((New-Label "Qlik Talend Cloud tenant binding" 20 210 320 22 -Bold))
 
-    # Instance Profile
-    $p.Controls.Add((New-Sep 20 240 720))
-    $p.Controls.Add((New-Label "EC2 Instance Profile" 20 255 300 22 -Bold))
-    $lblProf = New-Label "" 20 280 720 40
-    $lblProf.ForeColor = [System.Drawing.Color]::Gray
-    $script:Controls['lblProfileInfo'] = $lblProf
-    $p.Controls.Add($lblProf)
+    $lblBind = New-Label "Both values come from Administration > Network integrations in QTC, on the screen where you create the integration." 20 232 720
+    $lblBind.ForeColor = [System.Drawing.Color]::Gray
+    $lblBind.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lblBind)
+
+    $p.Controls.Add((New-Label "ExternalId" 20 260 110))
+    $p.Controls.Add((New-TextBox "txtQtcExternalId" 135 258 300))
+
+    $p.Controls.Add((New-Label "Qlik proxy role ARN" 20 292 130))
+    $p.Controls.Add((New-TextBox "txtQlikProxyArn" 160 290 560 "arn:aws:iam::000000000000:role/qlik-proxy-assume-role"))
+
+    $lblWhy = New-Label "Without these, the management role has no trust policy Qlik can use and the network integration will never connect." 20 320 720 32
+    $lblWhy.ForeColor = [System.Drawing.Color]::FromArgb(180,130,0)
+    $lblWhy.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lblWhy)
 
     $p.Add_VisibleChanged({
-        if ($this.Visible) {
-            $script:Controls['lblProfileInfo'].Text = "An instance profile '$($script:State.Prefix)-instance-profile' will be auto-created and linked to the selected IAM role."
+        if ($this.Visible -and $script:Controls['lblRoleNames']) {
+            $pfx = $script:State.Prefix
+            $script:Controls['lblRoleNames'].Text =
+                "management: $pfx-mgmt-role-iam    node: $pfx-ec2-role-iam    profile: $pfx-instance-profile"
         }
     })
 
@@ -1751,6 +1955,592 @@ function Build-Step4 {
 
 #endregion
 
+#region ── Google Cloud: Steps 1-4 ────────────────────────────
+#
+#  The Google Cloud page set. Steps 0 and 5 are shared with the AWS path;
+#  these four exist because the resources they collect have no useful overlap
+#  with VPC/security-group/IAM-role/Kinesis.
+#
+#  Open Lakehouse on Google Cloud is in Private Preview (opened 2 Sep 2026,
+#  GA planned Q4 2026). Preview scope is CDC and SaaS sources, so there is no
+#  streaming resource to collect - the AWS Kinesis slot is simply absent.
+
+$script:GcpRegions = @(
+    "us-central1", "us-east1", "us-east4", "us-west1",
+    "europe-west1", "europe-west2", "europe-west3", "europe-west4",
+    "asia-southeast1", "asia-northeast1"
+)
+
+function Sync-GcpState {
+    $s = $script:State
+    $s.Initials    = $script:Controls['txtGcpInitials'].Text.Trim().ToLower()
+    $s.Workload    = $script:Controls['txtGcpWorkload'].Text.Trim().ToLower()
+    $s.Environment = [string]$script:Controls['cboGcpEnv'].SelectedItem
+    $s.Region      = [string]$script:Controls['cboGcpRegion'].SelectedItem
+    Compute-Prefix
+}
+
+function Update-GcpDerivedNames {
+    # Keep the generated names in step with the prefix, but never clobber a
+    # value the user has typed over.
+    Sync-GcpState
+    $s = $script:State
+    if (-not $s.Prefix) { return }
+
+    $defaults = @{
+        'txtGcpSubnetNew'  = "$($s.Prefix)-subnet"
+        'txtGcpNetworkNew' = "$($s.Prefix)-vpc"
+        'txtGcpFirewall'   = "$($s.Prefix)-allow-internal"
+        'txtGcpRouter'     = "$($s.Prefix)-router"
+        'txtGcpNat'        = "$($s.Prefix)-nat"
+        'txtGcpKeyRing'    = "$($s.Prefix)-kr"
+        'txtGcpKeyName'    = "$($s.Prefix)-key"
+        'txtGcsTable'      = "$($s.Prefix)-table-gcs"
+        'txtGcsLanding'    = "$($s.Prefix)-landing-gcs"
+        'txtGcsConfig'     = "$($s.Prefix)-config-gcs"
+        'txtGcsTfState'    = "$($s.Prefix)-tfstate-gcs"
+    }
+    foreach ($key in $defaults.Keys) {
+        $ctl = $script:Controls[$key]
+        if ($ctl -and -not $ctl.Tag) { $ctl.Text = $defaults[$key] }
+    }
+
+    # Service account IDs are capped at 30 characters.
+    $mgmt = "$($s.Prefix)-mgmt"
+    $node = "$($s.Prefix)-node"
+    if ($mgmt.Length -gt 30) {
+        $mgmt = "$($s.Initials)-$($s.Environment)-olh-mgmt"
+        $node = "$($s.Initials)-$($s.Environment)-olh-node"
+    }
+    if ($script:Controls['txtGcpMgmtSa'] -and -not $script:Controls['txtGcpMgmtSa'].Tag) {
+        $script:Controls['txtGcpMgmtSa'].Text = $mgmt
+    }
+    if ($script:Controls['txtGcpNodeSa'] -and -not $script:Controls['txtGcpNodeSa'].Tag) {
+        $script:Controls['txtGcpNodeSa'].Text = $node
+    }
+}
+
+function Connect-Gcp {
+    $s = $script:State
+    Write-LogCyan "  Authenticating to Google Cloud..."
+
+    switch ($s.GcpAuthMethod) {
+        "login" {
+            Write-LogGray "  -> gcloud auth login"
+            Start-Process -FilePath "gcloud" -ArgumentList "auth login" -Wait -NoNewWindow
+        }
+        "keyfile" {
+            $kf = $script:Controls['txtGcpKeyFile'].Text.Trim()
+            if (-not (Test-Path -LiteralPath $kf)) {
+                Write-LogRed "  X   Key file not found: $kf"
+                [System.Windows.Forms.MessageBox]::Show("Key file not found:`n$kf", "Authentication", 'OK', 'Warning') | Out-Null
+                return
+            }
+            $s.GcpKeyFile = $kf
+            $null = Invoke-GcloudCmd "gcloud auth activate-service-account --key-file=`"$kf`""
+            # Terraform reads Application Default Credentials, which are a
+            # separate store from the gcloud CLI credential.
+            $env:GOOGLE_APPLICATION_CREDENTIALS = $kf
+            Write-LogGray "  GOOGLE_APPLICATION_CREDENTIALS set for Terraform."
+        }
+    }
+
+    $acct = Invoke-GcloudCmd "gcloud auth list --filter=status:ACTIVE --format=value(account)"
+    if (-not $acct) {
+        $s.GcpAuthenticated = $false
+        $script:Controls['lblGcpAuthStatus'].Text = "Not authenticated"
+        $script:Controls['lblGcpAuthStatus'].ForeColor = [System.Drawing.Color]::Red
+        Write-LogRed "  X   No active gcloud credentials."
+        return
+    }
+    $acct = ($acct -split "`n")[0].Trim()
+    $s.GcpAccount = $acct
+    $s.GcpAuthenticated = $true
+    $script:Controls['lblGcpAuthStatus'].Text = "Authenticated: $acct"
+    $script:Controls['lblGcpAuthStatus'].ForeColor = [System.Drawing.Color]::DarkGreen
+    Write-LogGreen "  OK  Authenticated as $acct"
+
+    Test-GcpAdc
+    Load-GcpProjects
+}
+
+function Test-GcpAdc {
+    # ADC is what the Terraform google provider uses. A run that authenticated
+    # the CLI but not ADC fails later at plan time with a confusing error, so
+    # surface it here instead.
+    if ($env:GOOGLE_APPLICATION_CREDENTIALS) { return }
+    $tok = Invoke-GcloudCmd "gcloud auth application-default print-access-token" -Silent
+    if ($tok) { Write-LogGreen "  OK  Application Default Credentials present."; return }
+
+    Write-LogYellow "  !!  No Application Default Credentials found."
+    $r = [System.Windows.Forms.MessageBox]::Show(
+        "Terraform's Google provider needs Application Default Credentials, which are separate from the gcloud CLI login.`n`nRun 'gcloud auth application-default login' now?",
+        "Application Default Credentials", 'YesNo', 'Question')
+    if ($r -eq 'Yes') {
+        Start-Process -FilePath "gcloud" -ArgumentList "auth application-default login" -Wait -NoNewWindow
+        Write-LogGreen "  ADC login finished."
+    } else {
+        Write-LogYellow "      Skipped - terraform init/plan/apply will likely fail to authenticate."
+    }
+}
+
+function Load-GcpProjects {
+    $cbo = $script:Controls['cboGcpProject']
+    $cbo.Items.Clear()
+    Write-LogGray "  Loading projects..."
+    $projects = Invoke-GcloudCmd "gcloud projects list --format=json" -AsJson
+    if (-not $projects) { Write-LogYellow "  !!  No projects returned."; return }
+    $script:State.GcpProjectList = @($projects)
+    foreach ($proj in @($projects)) {
+        $cbo.Items.Add("$($proj.projectId)  ($($proj.name))") | Out-Null
+    }
+    if ($cbo.Items.Count -gt 0) { $cbo.SelectedIndex = 0 }
+    Write-LogGreen "  OK  $($cbo.Items.Count) project(s) found."
+}
+
+function Select-GcpProject {
+    $cbo = $script:Controls['cboGcpProject']
+    if ($cbo.SelectedIndex -lt 0) { return }
+    $projId = (([string]$cbo.SelectedItem) -split '\s+')[0]
+    $script:State.GcpProjectId = $projId
+
+    $num = Invoke-GcloudCmd "gcloud projects describe $projId --format=value(projectNumber)"
+    if ($num) {
+        $script:State.GcpProjectNumber = $num.Trim()
+        $script:Controls['lblGcpProjectNum'].Text = "Project number: $($num.Trim())"
+        $null = Invoke-GcloudCmd "gcloud config set project $projId" -Silent
+        Write-LogGreen "  OK  Project $projId (number $($num.Trim()))"
+    } else {
+        $script:Controls['lblGcpProjectNum'].Text = "Project number: could not read"
+        Write-LogRed "  X   Cannot read project $projId."
+    }
+}
+
+function Build-Step1Gcp {
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Dock = 'Fill'
+
+    $p.Controls.Add((New-Label "Identity and Google Cloud Access" 20 10 500 24 -Bold -FontSize 11))
+
+    # ── Naming ──
+    $p.Controls.Add((New-Label "Owner initials" 20 44 110))
+    $t = New-TextBox "txtGcpInitials" 135 42 90
+    $t.Add_TextChanged({ Update-GcpDerivedNames })
+    $p.Controls.Add($t)
+
+    $p.Controls.Add((New-Label "Workload" 245 44 70))
+    $t = New-TextBox "txtGcpWorkload" 320 42 80 "olh"
+    $t.Add_TextChanged({ Update-GcpDerivedNames })
+    $p.Controls.Add($t)
+
+    $p.Controls.Add((New-Label "Environment" 420 44 80))
+    $c = New-ComboBox "cboGcpEnv" 505 42 90 @("dev","uat","prod") "dev"
+    $c.Add_SelectedIndexChanged({ Update-GcpDerivedNames })
+    $p.Controls.Add($c)
+
+    # ── Region and zones ──
+    $p.Controls.Add((New-Label "Region" 20 76 110))
+    $c = New-ComboBox "cboGcpRegion" 135 74 160 $script:GcpRegions "us-central1"
+    $c.Add_SelectedIndexChanged({
+        $reg = [string]$script:Controls['cboGcpRegion'].SelectedItem
+        $z = $script:Controls['txtGcpZones']
+        if ($z -and -not $z.Tag) { $z.Text = "$reg-a,$reg-b" }
+        Update-GcpDerivedNames
+    })
+    $p.Controls.Add($c)
+
+    $p.Controls.Add((New-Label "Zones" 315 76 50))
+    $t = New-TextBox "txtGcpZones" 370 74 225 "us-central1-a,us-central1-b"
+    $t.Add_TextChanged({ $this.Tag = "edited" })
+    $p.Controls.Add($t)
+
+    $lbl = New-Label "At least two, comma separated. The cluster spreads Spot VMs across them." 370 98 380
+    $lbl.ForeColor = [System.Drawing.Color]::Gray
+    $lbl.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lbl)
+
+    $p.Controls.Add((New-Sep 20 122 720))
+
+    # ── Authentication ──
+    $p.Controls.Add((New-Label "Authentication" 20 132 200 22 -Bold))
+
+    $rbCur = New-Object System.Windows.Forms.RadioButton
+    $rbCur.Text = "Use current gcloud credentials"; $rbCur.Location = [System.Drawing.Point]::new(20, 158)
+    $rbCur.Size = [System.Drawing.Size]::new(230, 22); $rbCur.Checked = $true
+    $rbCur.Add_CheckedChanged({ if ($this.Checked) { $script:State.GcpAuthMethod = "current"; Show-HideGcpAuthRows } })
+    $p.Controls.Add($rbCur)
+
+    $rbLogin = New-Object System.Windows.Forms.RadioButton
+    $rbLogin.Text = "gcloud auth login"; $rbLogin.Location = [System.Drawing.Point]::new(260, 158)
+    $rbLogin.Size = [System.Drawing.Size]::new(160, 22)
+    $rbLogin.Add_CheckedChanged({ if ($this.Checked) { $script:State.GcpAuthMethod = "login"; Show-HideGcpAuthRows } })
+    $p.Controls.Add($rbLogin)
+
+    $rbKey = New-Object System.Windows.Forms.RadioButton
+    $rbKey.Text = "Service account key"; $rbKey.Location = [System.Drawing.Point]::new(430, 158)
+    $rbKey.Size = [System.Drawing.Size]::new(170, 22)
+    $rbKey.Add_CheckedChanged({ if ($this.Checked) { $script:State.GcpAuthMethod = "keyfile"; Show-HideGcpAuthRows } })
+    $p.Controls.Add($rbKey)
+
+    $lblKf = New-Label "Key file" 20 188 70
+    $script:Controls['lblGcpKeyFile'] = $lblKf
+    $lblKf.Visible = $false
+    $p.Controls.Add($lblKf)
+
+    $t = New-TextBox "txtGcpKeyFile" 95 186 430
+    $t.Visible = $false
+    $p.Controls.Add($t)
+
+    $btnBrowse = New-Btn "Browse..." 535 185 90 25 {
+        $dlg = New-Object System.Windows.Forms.OpenFileDialog
+        $dlg.Filter = "JSON key (*.json)|*.json|All files (*.*)|*.*"
+        if ($dlg.ShowDialog() -eq 'OK') { $script:Controls['txtGcpKeyFile'].Text = $dlg.FileName }
+    }
+    $btnBrowse.Visible = $false
+    $script:Controls['btnGcpBrowseKey'] = $btnBrowse
+    $p.Controls.Add($btnBrowse)
+
+    $btnConn = New-Btn "Connect" 20 218 110 30 { Connect-Gcp }
+    $btnConn.BackColor = $script:Blue
+    $btnConn.ForeColor = [System.Drawing.Color]::White
+    $btnConn.FlatAppearance.BorderSize = 0
+    $p.Controls.Add($btnConn)
+
+    $lblSt = New-Label "Not authenticated" 145 224 480
+    $lblSt.ForeColor = [System.Drawing.Color]::Gray
+    $script:Controls['lblGcpAuthStatus'] = $lblSt
+    $p.Controls.Add($lblSt)
+
+    $p.Controls.Add((New-Sep 20 256 720))
+
+    # ── Project ──
+    $p.Controls.Add((New-Label "Project" 20 272 110 22 -Bold))
+    $c = New-ComboBox "cboGcpProject" 135 270 330
+    $c.Add_SelectedIndexChanged({ Select-GcpProject })
+    $p.Controls.Add($c)
+
+    $p.Controls.Add((New-Btn "Load Projects" 475 269 120 25 { Load-GcpProjects }))
+
+    $lblNum = New-Label "Project number: -" 135 298 400
+    $lblNum.ForeColor = [System.Drawing.Color]::Gray
+    $script:Controls['lblGcpProjectNum'] = $lblNum
+    $p.Controls.Add($lblNum)
+
+    $lblPrev = New-Label "Private Preview: your tenant must be enrolled before a lakehouse cluster can be created." 20 328 720
+    $lblPrev.ForeColor = [System.Drawing.Color]::FromArgb(180,130,0)
+    $lblPrev.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lblPrev)
+
+    return $p
+}
+
+function Show-HideGcpAuthRows {
+    $show = ($script:State.GcpAuthMethod -eq "keyfile")
+    foreach ($key in @('lblGcpKeyFile','txtGcpKeyFile','btnGcpBrowseKey')) {
+        if ($script:Controls[$key]) { $script:Controls[$key].Visible = $show }
+    }
+}
+
+function Load-GcpNetworks {
+    $s = $script:State
+    if (-not $s.GcpProjectId) {
+        [System.Windows.Forms.MessageBox]::Show("Select a project on the Identity step first.", "Network", 'OK', 'Warning') | Out-Null
+        return
+    }
+    $cbo = $script:Controls['cboGcpNetwork']
+    $cbo.Items.Clear()
+    Write-LogGray "  Loading VPC networks..."
+    $nets = Invoke-GcloudCmd "gcloud compute networks list --project=$($s.GcpProjectId) --format=json" -AsJson
+    if (-not $nets) { Write-LogYellow "  !!  No networks returned."; return }
+    $s.NetworkList = @($nets)
+    foreach ($n in @($nets)) { $cbo.Items.Add($n.name) | Out-Null }
+    if ($cbo.Items.Count -gt 0) { $cbo.SelectedIndex = 0 }
+    Write-LogGreen "  OK  $($cbo.Items.Count) network(s) found."
+}
+
+function Load-GcpSubnetworks {
+    $s = $script:State
+    $net = [string]$script:Controls['cboGcpNetwork'].SelectedItem
+    if (-not $s.GcpProjectId -or -not $net) { return }
+    $reg = [string]$script:Controls['cboGcpRegion'].SelectedItem
+    $cbo = $script:Controls['cboGcpSubnet']
+    $cbo.Items.Clear()
+    Write-LogGray "  Loading subnetworks in $reg..."
+    $subs = Invoke-GcloudCmd "gcloud compute networks subnets list --project=$($s.GcpProjectId) --regions=$reg --format=json" -AsJson
+    if (-not $subs) { Write-LogYellow "  !!  No subnetworks returned."; return }
+    $matching = @(@($subs) | Where-Object { $_.network -match "/$net$" })
+    $s.SubnetworkList = $matching
+    foreach ($sn in $matching) {
+        $pga = if ($sn.privateIpGoogleAccess) { "PGA on" } else { "PGA OFF" }
+        $cbo.Items.Add("$($sn.name)  $($sn.ipCidrRange)  $pga") | Out-Null
+    }
+    if ($cbo.Items.Count -gt 0) { $cbo.SelectedIndex = 0 }
+    Write-LogGreen "  OK  $($cbo.Items.Count) subnetwork(s) in $net."
+}
+
+function Select-GcpSubnetwork {
+    $cbo = $script:Controls['cboGcpSubnet']
+    if ($cbo.SelectedIndex -lt 0) { return }
+    $sn = $script:State.SubnetworkList[$cbo.SelectedIndex]
+    $script:State.SubnetworkName = $sn.name
+    $script:State.SubnetworkCidr = $sn.ipCidrRange
+    $script:State.PrivateGoogleAccess = [bool]$sn.privateIpGoogleAccess
+    $script:Controls['txtGcpSubnetCidr'].Text = $sn.ipCidrRange
+
+    $lbl = $script:Controls['lblGcpPga']
+    if ($script:State.PrivateGoogleAccess) {
+        $lbl.Text = "Private Google Access: on"
+        $lbl.ForeColor = [System.Drawing.Color]::DarkGreen
+    } else {
+        $lbl.Text = "Private Google Access: OFF - required by Open Lakehouse"
+        $lbl.ForeColor = [System.Drawing.Color]::Red
+    }
+    $script:Controls['btnGcpEnablePga'].Visible = (-not $script:State.PrivateGoogleAccess)
+}
+
+function Enable-GcpPga {
+    $s = $script:State
+    $reg = [string]$script:Controls['cboGcpRegion'].SelectedItem
+    Write-LogCyan "  Enabling Private Google Access on $($s.SubnetworkName)..."
+    $r = Invoke-GcloudCmd "gcloud compute networks subnets update $($s.SubnetworkName) --project=$($s.GcpProjectId) --region=$reg --enable-private-ip-google-access"
+    if ($null -ne $r) {
+        $s.PrivateGoogleAccess = $true
+        $script:Controls['lblGcpPga'].Text = "Private Google Access: on"
+        $script:Controls['lblGcpPga'].ForeColor = [System.Drawing.Color]::DarkGreen
+        $script:Controls['btnGcpEnablePga'].Visible = $false
+        Write-LogGreen "  OK  Private Google Access enabled."
+    } else {
+        Write-LogRed "  X   Could not enable Private Google Access."
+    }
+}
+
+function Build-Step2Gcp {
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Dock = 'Fill'
+
+    $p.Controls.Add((New-Label "Network" 20 10 400 24 -Bold -FontSize 11))
+    $lbl = New-Label "Private Google Access on the subnetwork is the Google Cloud counterpart of the S3 gateway endpoint." 20 36 720
+    $lbl.ForeColor = [System.Drawing.Color]::Gray
+    $lbl.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lbl)
+
+    # ── VPC network ──
+    $p.Controls.Add((New-Label "VPC network" 20 68 110))
+    $c = New-ComboBox "cboGcpNetwork" 135 66 260
+    $c.Add_SelectedIndexChanged({
+        $script:State.NetworkName = [string]$script:Controls['cboGcpNetwork'].SelectedItem
+        Load-GcpSubnetworks
+    })
+    $p.Controls.Add($c)
+    $p.Controls.Add((New-Btn "Load" 405 65 70 25 { Load-GcpNetworks }))
+
+    $chkNewNet = New-Object System.Windows.Forms.CheckBox
+    $chkNewNet.Text = "Create new"; $chkNewNet.Location = [System.Drawing.Point]::new(485, 67)
+    $chkNewNet.Size = [System.Drawing.Size]::new(95, 22)
+    $chkNewNet.Add_CheckedChanged({
+        $script:State.CreateNewVpc = $this.Checked
+        $script:Controls['txtGcpNetworkNew'].Enabled = $this.Checked
+        $script:Controls['cboGcpNetwork'].Enabled    = -not $this.Checked
+    })
+    $script:Controls['chkGcpNewNetwork'] = $chkNewNet
+    $p.Controls.Add($chkNewNet)
+
+    $t = New-TextBox "txtGcpNetworkNew" 585 66 160
+    $t.Enabled = $false
+    $t.Add_TextChanged({ $this.Tag = "edited" })
+    $p.Controls.Add($t)
+
+    # ── Subnetwork ──
+    $p.Controls.Add((New-Label "Subnetwork" 20 102 110))
+    $c = New-ComboBox "cboGcpSubnet" 135 100 260
+    $c.Add_SelectedIndexChanged({ Select-GcpSubnetwork })
+    $p.Controls.Add($c)
+    $p.Controls.Add((New-Btn "Load" 405 99 70 25 { Load-GcpSubnetworks }))
+
+    $chkNewSub = New-Object System.Windows.Forms.CheckBox
+    $chkNewSub.Text = "Create new"; $chkNewSub.Location = [System.Drawing.Point]::new(485, 101)
+    $chkNewSub.Size = [System.Drawing.Size]::new(95, 22)
+    $chkNewSub.Add_CheckedChanged({
+        $script:Controls['txtGcpSubnetNew'].Enabled = $this.Checked
+        $script:Controls['cboGcpSubnet'].Enabled    = -not $this.Checked
+    })
+    $script:Controls['chkGcpNewSubnet'] = $chkNewSub
+    $p.Controls.Add($chkNewSub)
+
+    $t = New-TextBox "txtGcpSubnetNew" 585 100 160
+    $t.Enabled = $false
+    $t.Add_TextChanged({ $this.Tag = "edited" })
+    $p.Controls.Add($t)
+
+    $p.Controls.Add((New-Label "Subnetwork CIDR" 20 136 110))
+    $p.Controls.Add((New-TextBox "txtGcpSubnetCidr" 135 134 160 "10.20.0.0/20"))
+
+    $lblPga = New-Label "Private Google Access: -" 315 136 340
+    $lblPga.ForeColor = [System.Drawing.Color]::Gray
+    $script:Controls['lblGcpPga'] = $lblPga
+    $p.Controls.Add($lblPga)
+
+    $btnPga = New-Btn "Enable now" 660 133 90 25 { Enable-GcpPga }
+    $btnPga.Visible = $false
+    $script:Controls['btnGcpEnablePga'] = $btnPga
+    $p.Controls.Add($btnPga)
+
+    $p.Controls.Add((New-Sep 20 168 720))
+
+    # ── Firewall ──
+    $p.Controls.Add((New-Label "Firewall rule" 20 182 110 22 -Bold))
+    $t = New-TextBox "txtGcpFirewall" 135 180 260
+    $t.Add_TextChanged({ $this.Tag = "edited" })
+    $p.Controls.Add($t)
+
+    $lbl = New-Label "Ingress: all TCP/UDP/ICMP from the subnetwork CIDR. Egress is already allowed by the implied default rule." 20 206 720
+    $lbl.ForeColor = [System.Drawing.Color]::Gray
+    $lbl.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lbl)
+
+    $p.Controls.Add((New-Sep 20 234 720))
+
+    # ── Cloud NAT ──
+    $p.Controls.Add((New-Label "Cloud Router" 20 248 110 22 -Bold))
+    $t = New-TextBox "txtGcpRouter" 135 246 260
+    $t.Add_TextChanged({ $this.Tag = "edited" })
+    $p.Controls.Add($t)
+
+    $p.Controls.Add((New-Label "Cloud NAT" 20 280 110))
+    $t = New-TextBox "txtGcpNat" 135 278 260
+    $t.Add_TextChanged({ $this.Tag = "edited" })
+    $p.Controls.Add($t)
+
+    $lbl = New-Label "Cluster nodes run without external IPs. Cloud NAT is how the agent reaches Qlik Talend Cloud - the counterpart of the AWS Internet Gateway." 20 306 720 32
+    $lbl.ForeColor = [System.Drawing.Color]::Gray
+    $lbl.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lbl)
+
+    return $p
+}
+
+function Build-Step3Gcp {
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Dock = 'Fill'
+
+    $p.Controls.Add((New-Label "Security, Identity and Tenant Binding" 20 10 500 24 -Bold -FontSize 11))
+
+    # ── Cloud KMS ──
+    $p.Controls.Add((New-Label "KMS key ring" 20 44 110))
+    $t = New-TextBox "txtGcpKeyRing" 135 42 200
+    $t.Add_TextChanged({ $this.Tag = "edited" })
+    $p.Controls.Add($t)
+
+    $p.Controls.Add((New-Label "KMS key" 350 44 70))
+    $t = New-TextBox "txtGcpKeyName" 425 42 200
+    $t.Add_TextChanged({ $this.Tag = "edited" })
+    $p.Controls.Add($t)
+
+    $lbl = New-Label "Symmetric CMEK for the lakehouse buckets. The Cloud Storage service agent is granted use of it automatically." 20 68 720
+    $lbl.ForeColor = [System.Drawing.Color]::Gray
+    $lbl.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lbl)
+
+    $p.Controls.Add((New-Sep 20 92 720))
+
+    # ── Service accounts ──
+    $p.Controls.Add((New-Label "Service accounts" 20 102 200 22 -Bold))
+
+    $p.Controls.Add((New-Label "Management" 20 130 110))
+    $t = New-TextBox "txtGcpMgmtSa" 135 128 200
+    $t.Add_TextChanged({ $this.Tag = "edited" })
+    $p.Controls.Add($t)
+
+    $p.Controls.Add((New-Label "Node" 350 130 70))
+    $t = New-TextBox "txtGcpNodeSa" 425 128 200
+    $t.Add_TextChanged({ $this.Tag = "edited" })
+    $p.Controls.Add($t)
+
+    $lbl = New-Label "Two accounts on purpose: QTC impersonates the management account from outside the project, while the node account is attached to the VMs and holds the data-plane grants." 20 154 720 32
+    $lbl.ForeColor = [System.Drawing.Color]::Gray
+    $lbl.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lbl)
+
+    $p.Controls.Add((New-Sep 20 192 720))
+
+    # ── QTC tenant binding ──
+    $p.Controls.Add((New-Label "Qlik Talend Cloud tenant binding" 20 202 300 22 -Bold))
+
+    $p.Controls.Add((New-Label "Tenant ID" 20 232 110))
+    $p.Controls.Add((New-TextBox "txtQtcTenantId" 135 230 260))
+
+    $lbl = New-Label "From Administration > Network integrations" 405 232 300
+    $lbl.ForeColor = [System.Drawing.Color]::Gray
+    $lbl.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lbl)
+
+    $p.Controls.Add((New-Label "Auth method" 20 264 110))
+    $c = New-ComboBox "cboQtcAuthMethod" 135 262 260 @("workload_identity","preauthorized_sa") "workload_identity"
+    $c.Add_SelectedIndexChanged({
+        $m = [string]$script:Controls['cboQtcAuthMethod'].SelectedItem
+        $script:State.QtcAuthMethod = $m
+        $isWif = ($m -eq "workload_identity")
+        $script:Controls['txtQtcIssuer'].Enabled = $isWif
+        $script:Controls['lblQtcIssuer'].Enabled = $isWif
+    })
+    $p.Controls.Add($c)
+
+    $lblIss = New-Label "OIDC issuer" 20 296 110
+    $script:Controls['lblQtcIssuer'] = $lblIss
+    $p.Controls.Add($lblIss)
+    $p.Controls.Add((New-TextBox "txtQtcIssuer" 135 294 400 "https://auth.qlik.com/oauth/token"))
+
+    $lblWarn = New-Label "Assumption: Qlik has not published the GCP authentication model for the Private Preview. Workload Identity Federation mirrors the assume-role + ExternalId pattern used on AWS. Confirm against your onboarding pack." 20 322 720 44
+    $lblWarn.ForeColor = [System.Drawing.Color]::FromArgb(180,130,0)
+    $lblWarn.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lblWarn)
+
+    return $p
+}
+
+function Build-Step4Gcp {
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Dock = 'Fill'
+
+    $p.Controls.Add((New-Label "Cloud Storage" 20 10 400 24 -Bold -FontSize 11))
+    $lbl = New-Label "All three lakehouse buckets are created with the CMEK above, uniform bucket-level access, and public access prevention." 20 36 720
+    $lbl.ForeColor = [System.Drawing.Color]::Gray
+    $lbl.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lbl)
+
+    $y = 70
+    foreach ($row in @(
+        @('Table storage', 'txtGcsTable',   'Iceberg table data'),
+        @('Landing',       'txtGcsLanding', 'Incoming data staged before conversion'),
+        @('Config',        'txtGcsConfig',  'Cluster runtime configuration'),
+        @('Terraform state','txtGcsTfState','Remote state for the GCP module (Google-managed encryption)')
+    )) {
+        $p.Controls.Add((New-Label $row[0] 20 ($y + 2) 110))
+        $t = New-TextBox $row[1] 135 $y 280
+        $t.Add_TextChanged({ $this.Tag = "edited" })
+        $p.Controls.Add($t)
+        $hint = New-Label $row[2] 425 ($y + 3) 330
+        $hint.ForeColor = [System.Drawing.Color]::Gray
+        $hint.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+        $p.Controls.Add($hint)
+        $y += 34
+    }
+
+    $p.Controls.Add((New-Sep 20 ($y + 8) 720))
+
+    $lblStream = New-Label "Streaming: none in this release." 20 ($y + 22) 300 22 -Bold
+    $p.Controls.Add($lblStream)
+
+    $lbl = New-Label "The Private Preview covers CDC and SaaS sources only, so there is no stream resource to provision - this is where the AWS path creates a Kinesis stream. Streaming on Google Cloud will be Kafka and GCS, arriving later in the preview." 20 ($y + 46) 720 46
+    $lbl.ForeColor = [System.Drawing.Color]::Gray
+    $lbl.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lbl)
+
+    return $p
+}
+
+#endregion
+
 #region ── Step 5: Review & Deploy ────────────────────────────
 
 function Build-Step5 {
@@ -1819,7 +2609,7 @@ function Build-Step5 {
 
     # Open Report
     $btnReport = New-Btn "Open Report" 530 280 110 28 {
-        $rpt = Join-Path $PWD "deploy-report.html"
+        $rpt = Join-Path $script:ScriptDir "deploy-report.html"
         if (Test-Path $rpt) { Start-Process $rpt }
     }
     $btnReport.Visible = $false
@@ -1828,7 +2618,7 @@ function Build-Step5 {
 
     # Open QTC File
     $btnQtc = New-Btn "Open QTC Ref" 650 280 110 28 {
-        $qtc = Join-Path $PWD "qlik-network-integration.txt"
+        $qtc = Join-Path $script:ScriptDir "qlik-network-integration.txt"
         if (Test-Path $qtc) { Start-Process "notepad.exe" -ArgumentList $qtc }
     }
     $btnQtc.Visible = $false
@@ -1858,6 +2648,7 @@ function Build-Step5 {
 }
 
 function Populate-Summary {
+    if ($script:State.Cloud -eq "gcp") { Populate-SummaryGcp; return }
     $s = $script:State
     $rtb = $script:Controls['rtbSummary']
     $rtb.Clear()
@@ -1872,7 +2663,6 @@ function Populate-Summary {
     $vpcNote   = if ($s.CreateNewVpc) { "[NEW - CIDR: $($script:Controls['txtNewVpcCidr'].Text)]" } else { "[existing]" }
     $sgNote    = if ($s.CreateNewSg)  { "[NEW]" } else { "[existing]" }
     $kmsNote   = if ($s.CreateNewKms) { "[NEW]" } else { "[existing]" }
-    $roleNote  = if ($s.CreateNewRole){ "[NEW]" } else { "[existing]" }
 
     $subLines = ($s.SubnetAzPairs | ForEach-Object {
         $tag = if ($_.IsNew) { " [NEW]" } else { "" }
@@ -1894,14 +2684,17 @@ $subLines
 
   --- Security ---
   KMS Key:        $($s.KmsKeyArn) $kmsNote
-  IAM Role:       $($s.MgmtRoleArn) $roleNote
+  Management role:  $($s.Prefix)-mgmt-role-iam   [trusted by Qlik, ExternalId required]
+  Node role:        $($s.Prefix)-ec2-role-iam    [EC2 trust, data-plane policy from Terraform]
   Instance Profile: $($s.Prefix)-instance-profile
+  Qlik proxy:       $($s.QlikProxyRoleArn)
+  QTC ExternalId:   $(if ($s.QtcExternalId) { "set" } else { "NOT SET" })
 
   --- Storage ---
   S3 Iceberg:     $($script:Controls['txtS3Iceberg'].Text)
   S3 Landing:     $($script:Controls['txtS3Landing'].Text)
   S3 Config:      $($script:Controls['txtS3Config'].Text)
-  Kinesis Stream: $($script:Controls['txtKinesis'].Text)
+  Kinesis Stream: $($script:Controls['txtKinesis'].Text)  (1 shard)
 "@
     $rtb.Text = $text
 
@@ -1951,7 +2744,67 @@ function Update-Progress {
     [System.Windows.Forms.Application]::DoEvents()
 }
 
+function Invoke-TerraformFlow {
+    # init -> plan -> (ask) -> apply, all in the given root module directory.
+    # Shared by both clouds; only the backend arguments differ.
+    param([string]$WorkDir, [string]$InitArgs)
+
+    function Start-Tf {
+        param([string]$Arguments, [string]$Dir)
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName  = "terraform"
+        $psi.Arguments = $Arguments
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow  = $true
+        $psi.WorkingDirectory = $Dir
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+        $proc.WaitForExit()
+        return [PSCustomObject]@{ Code = $proc.ExitCode; Out = $outTask.Result; Err = $errTask.Result }
+    }
+
+    Write-LogGray "  -> terraform $InitArgs"
+    $r1 = Start-Tf -Arguments $InitArgs -Dir $WorkDir
+    if ($r1.Code -ne 0) {
+        Write-LogRed "  X  terraform init failed (exit $($r1.Code))"
+        if ($r1.Err) { Write-LogRed ("  " + (($r1.Err.Trim() -split "`n" | Select-Object -First 8) -join "`n  ")) }
+        return
+    }
+    Write-LogGreen "  OK  terraform init complete"
+
+    Write-LogGray "  -> terraform plan"
+    $r2 = Start-Tf -Arguments "plan -var-file=`"terraform.tfvars`" -out=`"tfplan`"" -Dir $WorkDir
+    if ($r2.Code -ne 0) {
+        Write-LogRed "  X  terraform plan failed (exit $($r2.Code))"
+        if ($r2.Err) { Write-LogRed ("  " + (($r2.Err.Trim() -split "`n" | Select-Object -First 12) -join "`n  ")) }
+        return
+    }
+    Write-LogGreen "  OK  terraform plan saved to tfplan"
+
+    $ans = [System.Windows.Forms.MessageBox]::Show("Terraform plan is ready. Apply now?", "Terraform Apply", 'YesNo', 'Question')
+    if ($ans -ne 'Yes') { return }
+
+    Write-LogGray "  -> terraform apply tfplan"
+    $r3 = Start-Tf -Arguments "apply `"tfplan`"" -Dir $WorkDir
+    if ($r3.Code -eq 0) {
+        Write-LogGreen "  OK  terraform apply complete!"
+        $r4 = Start-Tf -Arguments "output qtc_summary" -Dir $WorkDir
+        if ($r4.Code -eq 0 -and $r4.Out) {
+            Write-LogCyan "`n  QTC integration values:"
+            Write-LogGray $r4.Out.TrimEnd()
+        }
+    } else {
+        Write-LogRed "  X  terraform apply failed (exit $($r3.Code))"
+        if ($r3.Err) { Write-LogRed ("  " + (($r3.Err.Trim() -split "`n" | Select-Object -First 8) -join "`n  ")) }
+    }
+}
+
 function Start-Deploy {
+    if ($script:State.Cloud -eq "gcp") { Start-DeployGcp; return }
+
     $s       = $script:State
     $DryRun  = ($s.Mode -eq "DryRun")
     $PREFIX  = $s.Prefix
@@ -1966,7 +2819,7 @@ function Start-Deploy {
         Update-Progress 10 "Running drift detection..."
         Write-Log "  Running drift detection for $PREFIX..." -Bold $true
 
-        $tfvarsPath = Join-Path $PWD "terraform.tfvars"
+        $tfvarsPath = Join-Path (Get-TerraformDir) "terraform.tfvars"
         if (-not (Test-Path $tfvarsPath)) {
             Write-LogRed "  X  terraform.tfvars not found. Run a deployment first."
             Deploy-Complete; return
@@ -1976,23 +2829,26 @@ function Start-Deploy {
             if ($Content -match "$Key\s*=\s*`"([^`"]+)`"") { return $Matches[1] }; return "(not set)"
         }
 
+        # Each resource is looked up BY the value in tfvars, not by a
+        # prefix-derived Name tag: a resource the user named differently is not
+        # drift. A failed lookup means the resource is gone (or unreadable).
         Update-Progress 30 "Checking VPC..."
         $tfVpc = Local:Get-TfVal "vpc_id" $tfContent
-        $liveVpc = Invoke-AwsCmd "aws ec2 describe-vpcs --region $($s.Region) --filters `"Name=tag:Name,Values=$PREFIX-vpc`" --query `"Vpcs[0].VpcId`" --output text" -Silent
-        $st = if ($tfVpc -eq $liveVpc) { "MATCH" } else { "DRIFT" }
-        if ($st -eq "MATCH") { Write-LogGreen "  VPC:  $tfVpc  ->  $st" } else { Write-LogRed "  VPC:  Expected=$tfVpc  Live=$liveVpc  ->  $st" }
+        $liveVpc = if ($tfVpc -ne "(not set)") { Invoke-AwsCmd "aws ec2 describe-vpcs --region $($s.Region) --vpc-ids $tfVpc --query `"Vpcs[0].VpcId`" --output text" -Silent } else { $null }
+        $st = if ($liveVpc -and $liveVpc -eq $tfVpc) { "MATCH" } else { "NOT_FOUND" }
+        if ($st -eq "MATCH") { Write-LogGreen "  VPC:  $tfVpc  ->  $st" } else { Write-LogRed "  VPC:  Expected=$tfVpc  Live=$(if ($liveVpc) { $liveVpc } else { '(absent)' })  ->  $st" }
 
         Update-Progress 50 "Checking Security Group..."
         $tfSg = Local:Get-TfVal "security_group_id" $tfContent
-        $liveSg = Invoke-AwsCmd "aws ec2 describe-security-groups --region $($s.Region) --filters `"Name=tag:Name,Values=$PREFIX-sg`" --query `"SecurityGroups[0].GroupId`" --output text" -Silent
-        $st = if ($tfSg -eq $liveSg) { "MATCH" } else { "DRIFT" }
-        if ($st -eq "MATCH") { Write-LogGreen "  SG:   $tfSg  ->  $st" } else { Write-LogRed "  SG:   Expected=$tfSg  Live=$liveSg  ->  $st" }
+        $liveSg = if ($tfSg -ne "(not set)") { Invoke-AwsCmd "aws ec2 describe-security-groups --region $($s.Region) --group-ids $tfSg --query `"SecurityGroups[0].GroupId`" --output text" -Silent } else { $null }
+        $st = if ($liveSg -and $liveSg -eq $tfSg) { "MATCH" } else { "NOT_FOUND" }
+        if ($st -eq "MATCH") { Write-LogGreen "  SG:   $tfSg  ->  $st" } else { Write-LogRed "  SG:   Expected=$tfSg  Live=$(if ($liveSg) { $liveSg } else { '(absent)' })  ->  $st" }
 
         Update-Progress 70 "Checking Kinesis..."
         $tfKin = Local:Get-TfVal "kinesis_stream_name" $tfContent
-        $liveKin = Invoke-AwsCmd "aws kinesis describe-stream-summary --stream-name `"$PREFIX-stream-kinesis`" --region $($s.Region) --query `"StreamDescriptionSummary.StreamName`" --output text" -Silent
-        $st = if ($tfKin -eq $liveKin) { "MATCH" } else { "DRIFT" }
-        if ($st -eq "MATCH") { Write-LogGreen "  Kinesis: $tfKin  ->  $st" } else { Write-LogRed "  Kinesis: Expected=$tfKin  Live=$liveKin  ->  $st" }
+        $liveKin = if ($tfKin -ne "(not set)") { Invoke-AwsCmd "aws kinesis describe-stream-summary --stream-name `"$tfKin`" --region $($s.Region) --query `"StreamDescriptionSummary.StreamName`" --output text" -Silent } else { $null }
+        $st = if ($liveKin -and $liveKin -eq $tfKin) { "MATCH" } else { "NOT_FOUND" }
+        if ($st -eq "MATCH") { Write-LogGreen "  Kinesis: $tfKin  ->  $st" } else { Write-LogRed "  Kinesis: Expected=$tfKin  Live=$(if ($liveKin) { $liveKin } else { '(absent)' })  ->  $st" }
 
         Update-Progress 100 "Drift detection complete"
         Write-LogGreen "`n  OK  Drift detection complete."
@@ -2007,24 +2863,31 @@ function Start-Deploy {
         # Read the ACTUAL resource names from terraform.tfvars when present --
         # the user may have customized them during deployment; recomputing
         # defaults from $PREFIX would miss (orphan) renamed resources.
-        $twTfvars = Join-Path $PWD "terraform.tfvars"
+        $twTfDir  = Get-TerraformDir
+        $twTfvars = Join-Path $twTfDir "terraform.tfvars"
         $twIceberg = "$PREFIX-iceberg-s3"; $twKinesis = "$PREFIX-stream-kinesis"
+        $twLanding = "$PREFIX-landing-s3"; $twConfig  = "$PREFIX-config-s3"
         if (Test-Path $twTfvars) {
             $twContent = Get-Content $twTfvars -Raw
             if ($twContent -match 's3_bucket_name\s*=\s*"([^"]+)"')      { $twIceberg = $Matches[1] }
+            if ($twContent -match 's3_landing_bucket\s*=\s*"([^"]+)"')   { $twLanding = $Matches[1] }
+            if ($twContent -match 's3_config_bucket\s*=\s*"([^"]+)"')    { $twConfig  = $Matches[1] }
             if ($twContent -match 'kinesis_stream_name\s*=\s*"([^"]+)"') { $twKinesis = $Matches[1] }
         } else {
             Write-LogYellow "  !!  terraform.tfvars not found -- using default names derived from prefix."
         }
 
-        if ($script:State.TerraformOk) {
+        # Process.Start throws on a WorkingDirectory that does not exist.
+        if ($script:State.TerraformOk -and -not (Test-Path -LiteralPath $twTfDir)) {
+            Write-LogYellow "  !!  $twTfDir not found -- skipping terraform destroy."
+        } elseif ($script:State.TerraformOk) {
             Update-Progress 15 "Running terraform destroy..."
             Write-LogGray "  -> terraform destroy -auto-approve -var-file=terraform.tfvars"
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = "terraform"; $psi.Arguments = "destroy -auto-approve -var-file=terraform.tfvars"
             $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
             $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
-            $psi.WorkingDirectory = $PWD.Path
+            $psi.WorkingDirectory = $twTfDir
             $proc = [System.Diagnostics.Process]::Start($psi)
             # Drain both pipes asynchronously BEFORE WaitForExit -- terraform is
             # verbose enough to fill the pipe buffer and deadlock otherwise.
@@ -2042,16 +2905,18 @@ function Start-Deploy {
         }
 
         Update-Progress 40 "Removing S3 buckets..."
-        foreach ($bucket in @($twIceberg,"$PREFIX-landing-s3","$PREFIX-config-s3")) {
+        foreach ($bucket in @($twIceberg, $twLanding, $twConfig)) {
             Write-LogGray "  -> Emptying & deleting: $bucket"
             Invoke-AwsCmd "aws s3 rm s3://$bucket --recursive --region $($s.Region)" -Silent
-            Invoke-AwsCmd "aws s3api delete-bucket --bucket $bucket --region $($s.Region)" -Silent
-            Write-LogGreen "  OK  Removed: $bucket"
+            $bktDel = Invoke-AwsCmd "aws s3api delete-bucket --bucket $bucket --region $($s.Region)" -Silent
+            if ($null -ne $bktDel) { Write-LogGreen "  OK  Removed: $bucket" }
+            else { Write-LogRed "  X   Could not delete bucket: $bucket (absent, not empty, or access denied)" }
         }
 
         Update-Progress 60 "Removing Kinesis stream..."
-        Invoke-AwsCmd "aws kinesis delete-stream --stream-name $twKinesis --region $($s.Region)" -Silent
-        Write-LogGreen "  OK  Kinesis stream removed ($twKinesis)"
+        $kinDel = Invoke-AwsCmd "aws kinesis delete-stream --stream-name $twKinesis --region $($s.Region)" -Silent
+        if ($null -ne $kinDel) { Write-LogGreen "  OK  Kinesis stream removed ($twKinesis)" }
+        else { Write-LogRed "  X   Could not delete Kinesis stream: $twKinesis (absent or access denied)" }
 
         Update-Progress 80 "Removing IAM resources..."
         Invoke-AwsCmd "aws iam remove-role-from-instance-profile --instance-profile-name $PREFIX-instance-profile --role-name $PREFIX-ec2-role-iam" -Silent
@@ -2069,7 +2934,7 @@ function Start-Deploy {
     # Step 1: Pre-flight permission check
     $step++; Update-Progress ([int]($step/$totalSteps*100)) "Pre-flight: permission check..."
     Write-Log "  -- Pre-flight Checks --" -Bold $true
-    $services = @{
+    $services = [ordered]@{
         "EC2"     = @("ec2:CreateVpc","ec2:CreateSubnet","ec2:CreateSecurityGroup","ec2:DescribeVpcs")
         "S3"      = @("s3:CreateBucket","s3:PutBucketPolicy","s3:PutEncryptionConfiguration")
         "IAM"     = @("iam:CreateRole","iam:CreateInstanceProfile","iam:AttachRolePolicy")
@@ -2078,8 +2943,35 @@ function Start-Deploy {
         "Glue"    = @("glue:CreateDatabase","glue:GetDatabase")
         "STS"     = @("sts:GetCallerIdentity")
     }
-    foreach ($svc in $services.Keys) {
-        Write-LogGreen "  OK  $svc permissions assumed"
+    # simulate-principal-policy only evaluates an IAM role/user as the policy
+    # source. A verified caller is usually an STS session ARN
+    # (arn:aws:sts::<acct>:assumed-role/<RoleName>/<session>), which has to be
+    # rewritten to the underlying role first.
+    $policySourceArn = ""
+    if     ($s.CallerArn -match '^arn:([^:]+):sts::(\d+):assumed-role/([^/]+)/') {
+        $simRole = $Matches[3]
+        $policySourceArn = "arn:$($Matches[1]):iam::$($Matches[2]):role/$simRole"
+        # The session ARN drops the role's IAM path (SSO roles live under
+        # /aws-reserved/sso.amazonaws.com/), so prefer the ARN IAM reports.
+        $simRoleArn = Invoke-AwsCmd "aws iam get-role --role-name $simRole --query Role.Arn --output text" -Silent
+        if ($simRoleArn) { $policySourceArn = $simRoleArn }
+    }
+    elseif ($s.CallerArn -match '^arn:[^:]+:iam::\d+:(role|user)/')              { $policySourceArn = $s.CallerArn }
+    if (-not $policySourceArn) {
+        Write-LogYellow "  !!  Permissions NOT verified: no IAM role/user ARN for caller '$($s.CallerArn)'"
+    } else {
+        Write-LogGray "  Simulating required actions against $policySourceArn"
+        foreach ($svc in $services.Keys) {
+            $sim = Invoke-AwsCmd "aws iam simulate-principal-policy --policy-source-arn `"$policySourceArn`" --action-names $($services[$svc] -join ' ') --output json" -AsJson -Silent
+            if (-not $sim -or -not $sim.EvaluationResults) {
+                # Never a green OK for something that was not measured.
+                Write-LogYellow "  !!  $svc permissions could not be verified (simulate call failed)"
+                continue
+            }
+            $denied = @($sim.EvaluationResults | Where-Object { $_.EvalDecision -ne "allowed" })
+            if ($denied.Count -eq 0) { Write-LogGreen "  OK  $svc permissions allowed" }
+            else { Write-LogRed "  X   $svc denied: $(($denied | ForEach-Object { "$($_.EvalActionName) ($($_.EvalDecision))" }) -join ', ')" }
+        }
     }
 
     # Step 2: CloudTrail check
@@ -2140,6 +3032,35 @@ function Start-Deploy {
         }
     }
 
+    # Step 5b: Subnet prerequisite check
+    #
+    # terraform/aws/main.tf refuses to plan unless every cluster subnet
+    # auto-assigns public IPs (null_resource.olh_prerequisites). Check it here,
+    # where the selection is known, instead of sending the user into a plan
+    # that fails. Mirrors the bash wizard's Subnet Prerequisite Check.
+    if (-not $DryRun) {
+        $nonPublic = @()
+        foreach ($snPair in $subnetAzPairs) {
+            $mapPub = Invoke-AwsCmd "aws ec2 describe-subnets --subnet-ids $($snPair.Subnet) --region $($s.Region) --query `"Subnets[0].MapPublicIpOnLaunch`" --output text" -Silent
+            if ($mapPub -ne "True") { $nonPublic += $snPair.Subnet }
+        }
+        if ($nonPublic.Count -gt 0) {
+            Write-LogYellow "  !!  These subnets do not auto-assign public IPs: $($nonPublic -join ', ')"
+            Write-LogGray   "      OLH cluster subnets must be public. Terraform will refuse to plan otherwise."
+            $fixSn = [System.Windows.Forms.MessageBox]::Show(
+                "These subnets do not auto-assign public IPs:`n`n$($nonPublic -join "`n")`n`nOpen Lakehouse requires public cluster subnets; terraform plan will refuse otherwise.`n`nEnable auto-assign public IP on them now?",
+                "Subnet Prerequisite", 'YesNo', 'Warning')
+            if ($fixSn -eq 'Yes') {
+                foreach ($sn in $nonPublic) {
+                    $upd = Invoke-AwsCmd "aws ec2 modify-subnet-attribute --subnet-id $sn --region $($s.Region) --map-public-ip-on-launch" -Silent
+                    if ($null -ne $upd) { Write-LogGreen "  OK  $sn updated." } else { Write-LogRed "  X   Could not update $sn." }
+                }
+            }
+        } else {
+            Write-LogGreen "  OK  All selected subnets auto-assign public IPs."
+        }
+    }
+
     # Step 6: Security Group
     $step++; Update-Progress ([int]($step/$totalSteps*100)) "Network: Security Group..."
     $SG_ID = $s.SgId
@@ -2147,12 +3068,16 @@ function Start-Deploy {
         if ($DryRun) {
             $SG_ID = "sg-DRYRUN"; Write-LogYellow "  [DRY-RUN] Would create security group $PREFIX-sg"
         } else {
-            Write-LogGray "  Creating $PREFIX-sg (egress 443 only)..."
+            Write-LogGray "  Creating $PREFIX-sg (inbound all TCP from the VPC CIDR)..."
             $sgOut = Invoke-AwsCmd "aws ec2 create-security-group --group-name `"$PREFIX-sg`" --description `"Qlik OLH $PREFIX`" --vpc-id $VPC_ID --region $($s.Region) --tag-specifications `"$(Build-TagSpec 'security-group' "$PREFIX-sg")`" --output json" -AsJson
             if ($sgOut) {
                 $SG_ID = $sgOut.GroupId
-                Invoke-AwsCmd "aws ec2 authorize-security-group-egress --group-id $SG_ID --region $($s.Region) --ip-permissions `"IpProtocol=tcp,FromPort=443,ToPort=443,IpRanges=[{CidrIp=0.0.0.0/0}]`"" -Silent
-                Write-LogGreen "  OK  Created SG: $SG_ID"
+                # Open Lakehouse requires inbound All TCP from the VPC CIDR so
+                # cluster nodes and the network integration agent can reach each
+                # other. Outbound needs no rule: AWS attaches an allow-all egress
+                # rule to every new security group, which is what OLH asks for.
+                Invoke-AwsCmd "aws ec2 authorize-security-group-ingress --group-id $SG_ID --region $($s.Region) --ip-permissions `"IpProtocol=tcp,FromPort=0,ToPort=65535,IpRanges=[{CidrIp=$VPC_CIDR}]`"" -Silent
+                Write-LogGreen "  OK  Created SG: $SG_ID  (ingress all TCP from $VPC_CIDR, egress all)"
             }
         }
     } else {
@@ -2181,59 +3106,127 @@ function Start-Deploy {
         Write-LogGreen "  OK  Using KMS: $KMS_KEY_ARN"
     }
 
-    # Step 8: IAM Role
-    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Security: IAM Role..."
-    $MGMT_ROLE_ARN = $s.MgmtRoleArn
-    if ($s.CreateNewRole) {
-        $trustPolicy = '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-        if ($DryRun) {
-            $MGMT_ROLE_ARN = "arn:aws:iam::${acctId}:role/$PREFIX-ec2-role-iam-DRYRUN"
-            Write-LogYellow "  [DRY-RUN] Would create IAM role $PREFIX-ec2-role-iam"
-        } else {
-            Write-LogGray "  Creating IAM role $PREFIX-ec2-role-iam..."
-            Invoke-AwsCmd "aws iam create-role --role-name `"$PREFIX-ec2-role-iam`" --assume-role-policy-document '$trustPolicy' --tags `"Key=Owner,Value=$($s.Initials)`" `"Key=Environment,Value=$($s.Environment)`" `"Key=Workload,Value=qlik-olh`" `"Key=CreateDate,Value=$($s.CreateDate)`" `"Key=ManagedBy,Value=script`"" -Silent
-            $MGMT_ROLE_ARN = "arn:aws:iam::${acctId}:role/$PREFIX-ec2-role-iam"
-            Invoke-AwsCmd "aws iam attach-role-policy --role-name `"$PREFIX-ec2-role-iam`" --policy-arn `"arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore`"" -Silent
-            Write-LogGreen "  OK  Created: $MGMT_ROLE_ARN"
-        }
-    } else {
-        Write-LogGreen "  OK  Using role: $MGMT_ROLE_ARN"
-    }
+    # Step 8: IAM roles
+    #
+    # Two roles, and it matters which is which. The management role is assumed
+    # by Qlik from outside the account and carries the ExternalId condition;
+    # the node role is assumed by EC2, goes into the instance profile, and
+    # receives the S3/Kinesis/KMS/Glue policy from Terraform. Earlier versions
+    # created only the EC2 role and reported it as mgmt_role_arn, which left
+    # QTC with nothing it could assume.
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Security: IAM management role..."
+    $MGMT_ROLE_NAME = "$PREFIX-mgmt-role-iam"
+    $NODE_ROLE_NAME = "$PREFIX-ec2-role-iam"
 
-    # Step 9: Instance Profile
-    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Security: Instance Profile..."
-    $INSTANCE_PROFILE_ARN = $s.InstanceProfileArn
-    if ($s.CreateNewRole) {
-        if ($DryRun) {
-            $INSTANCE_PROFILE_ARN = "arn:aws:iam::${acctId}:instance-profile/$PREFIX-instance-profile-DRYRUN"
-            Write-LogYellow "  [DRY-RUN] Would create instance profile"
+    $mgmtTrust = @{
+        Version = "2012-10-17"
+        Statement = @(@{
+            Effect    = "Allow"
+            Principal = @{ AWS = $s.QlikProxyRoleArn }
+            Action    = "sts:AssumeRole"
+            Condition = @{ StringEquals = @{ "sts:ExternalId" = $s.QtcExternalId } }
+        })
+    } | ConvertTo-Json -Depth 8 -Compress
+
+    $mgmtTrustFile = Join-Path $env:TEMP "olh-mgmt-trust-$PID.json"
+    $nodeTrustFile = Join-Path $env:TEMP "olh-node-trust-$PID.json"
+    $nodeTrust = '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
+    if ($DryRun) {
+        $MGMT_ROLE_ARN = "arn:aws:iam::${acctId}:role/$MGMT_ROLE_NAME-DRYRUN"
+        Write-LogYellow "  [DRY-RUN] Would create management role $MGMT_ROLE_NAME"
+        Write-LogGray   "            trusting $($s.QlikProxyRoleArn) with sts:ExternalId"
+    } else {
+        # Passed as a file:// argument: the policy contains quotes and braces
+        # that do not survive being spliced into a command line.
+        Set-Content -Path $mgmtTrustFile -Value $mgmtTrust -Encoding ASCII
+        $existing = Invoke-AwsCmd "aws iam get-role --role-name `"$MGMT_ROLE_NAME`" --output json" -AsJson -Silent
+        if ($existing) {
+            Write-LogGreen "  OK  Management role exists: $MGMT_ROLE_NAME"
+            Invoke-AwsCmd "aws iam update-assume-role-policy --role-name `"$MGMT_ROLE_NAME`" --policy-document file://$mgmtTrustFile" -Silent
+            Write-LogGray  "      Trust policy refreshed with the ExternalId you entered."
         } else {
-            Write-LogGray "  Creating instance profile..."
-            Invoke-AwsCmd "aws iam create-instance-profile --instance-profile-name `"$PREFIX-instance-profile`" --tags `"Key=Owner,Value=$($s.Initials)`" `"Key=Environment,Value=$($s.Environment)`" `"Key=CreateDate,Value=$($s.CreateDate)`"" -Silent
-            Invoke-AwsCmd "aws iam add-role-to-instance-profile --instance-profile-name `"$PREFIX-instance-profile`" --role-name `"$PREFIX-ec2-role-iam`"" -Silent
-            $INSTANCE_PROFILE_ARN = "arn:aws:iam::${acctId}:instance-profile/$PREFIX-instance-profile"
-            Write-LogGreen "  OK  Created: $INSTANCE_PROFILE_ARN"
+            Write-LogGray "  Creating management role $MGMT_ROLE_NAME..."
+            Invoke-AwsCmd "aws iam create-role --role-name `"$MGMT_ROLE_NAME`" --description `"Qlik Talend Cloud management role for $PREFIX`" --assume-role-policy-document file://$mgmtTrustFile --tags `"Key=Owner,Value=$($s.Initials)`" `"Key=Environment,Value=$($s.Environment)`" `"Key=Workload,Value=qlik-olh`" `"Key=CreateDate,Value=$($s.CreateDate)`" `"Key=ManagedBy,Value=script`"" -Silent
+            Write-LogGreen "  OK  Created: $MGMT_ROLE_NAME"
+            Write-LogGray  "      Trust: $($s.QlikProxyRoleArn) with sts:ExternalId"
         }
-    } elseif (-not $INSTANCE_PROFILE_ARN) {
-        # Existing role selected but no instance profile known: discover the
-        # profile attached to that role, or create one if the role has none.
-        $roleName = ($MGMT_ROLE_ARN -split '/')[-1]
-        Write-LogGray "  Looking up instance profile for role: $roleName"
-        $profJson = Invoke-AwsCmd "aws iam list-instance-profiles-for-role --role-name `"$roleName`" --output json" -AsJson -Silent
-        if ($profJson -and $profJson.InstanceProfiles -and $profJson.InstanceProfiles.Count -gt 0) {
-            $INSTANCE_PROFILE_ARN = $profJson.InstanceProfiles[0].Arn
-            Write-LogGreen "  OK  Found instance profile: $INSTANCE_PROFILE_ARN"
-        } elseif ($DryRun) {
-            $INSTANCE_PROFILE_ARN = "arn:aws:iam::${acctId}:instance-profile/$PREFIX-instance-profile-DRYRUN"
-            Write-LogYellow "  [DRY-RUN] Would create instance profile for existing role"
+        Remove-Item $mgmtTrustFile -Force -ErrorAction SilentlyContinue
+        $MGMT_ROLE_ARN = "arn:aws:iam::${acctId}:role/$MGMT_ROLE_NAME"
+    }
+    $s.MgmtRoleArn = $MGMT_ROLE_ARN
+
+    # Step 9: EC2 node role
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Security: EC2 node role..."
+    if ($DryRun) {
+        $NODE_ROLE_ARN = "arn:aws:iam::${acctId}:role/$NODE_ROLE_NAME-DRYRUN"
+        Write-LogYellow "  [DRY-RUN] Would create node role $NODE_ROLE_NAME"
+    } else {
+        $existingNode = Invoke-AwsCmd "aws iam get-role --role-name `"$NODE_ROLE_NAME`" --output json" -AsJson -Silent
+        if ($existingNode) {
+            Write-LogGreen "  OK  Node role exists: $NODE_ROLE_NAME"
         } else {
-            Write-LogGray "  Role has no instance profile -- creating one..."
-            Invoke-AwsCmd "aws iam create-instance-profile --instance-profile-name `"$PREFIX-instance-profile`" --tags `"Key=Owner,Value=$($s.Initials)`" `"Key=Environment,Value=$($s.Environment)`" `"Key=CreateDate,Value=$($s.CreateDate)`"" -Silent
-            Invoke-AwsCmd "aws iam add-role-to-instance-profile --instance-profile-name `"$PREFIX-instance-profile`" --role-name `"$roleName`"" -Silent
-            $INSTANCE_PROFILE_ARN = "arn:aws:iam::${acctId}:instance-profile/$PREFIX-instance-profile"
-            Write-LogGreen "  OK  Created: $INSTANCE_PROFILE_ARN"
+            Set-Content -Path $nodeTrustFile -Value $nodeTrust -Encoding ASCII
+            Write-LogGray "  Creating node role $NODE_ROLE_NAME..."
+            Invoke-AwsCmd "aws iam create-role --role-name `"$NODE_ROLE_NAME`" --description `"Qlik Open Lakehouse EC2 node role for $PREFIX`" --assume-role-policy-document file://$nodeTrustFile --tags `"Key=Owner,Value=$($s.Initials)`" `"Key=Environment,Value=$($s.Environment)`" `"Key=Workload,Value=qlik-olh`" `"Key=CreateDate,Value=$($s.CreateDate)`" `"Key=ManagedBy,Value=script`"" -Silent
+            Invoke-AwsCmd "aws iam attach-role-policy --role-name `"$NODE_ROLE_NAME`" --policy-arn `"arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore`"" -Silent
+            Remove-Item $nodeTrustFile -Force -ErrorAction SilentlyContinue
+            Write-LogGreen "  OK  Created: $NODE_ROLE_NAME (SSM Core attached)"
+            Write-LogGray  "      Terraform adds the S3/Kinesis/KMS/Glue data-plane policy."
+        }
+        $NODE_ROLE_ARN = "arn:aws:iam::${acctId}:role/$NODE_ROLE_NAME"
+    }
+    $s.NodeRoleArn = $NODE_ROLE_ARN
+
+    # Step 9b: Instance profile, holding the node role
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Security: Instance Profile..."
+    $PROFILE_NAME = "$PREFIX-instance-profile"
+    if ($DryRun) {
+        $INSTANCE_PROFILE_ARN = "arn:aws:iam::${acctId}:instance-profile/$PROFILE_NAME-DRYRUN"
+        Write-LogYellow "  [DRY-RUN] Would create instance profile $PROFILE_NAME"
+    } else {
+        $prof = Invoke-AwsCmd "aws iam get-instance-profile --instance-profile-name `"$PROFILE_NAME`" --output json" -AsJson -Silent
+        if ($prof) {
+            Write-LogGreen "  OK  Instance profile exists: $PROFILE_NAME"
+            $held = @($prof.InstanceProfile.Roles | ForEach-Object { $_.RoleName })
+            if ($held -notcontains $NODE_ROLE_NAME) {
+                if ($held.Count -eq 0) {
+                    Write-LogYellow "  !!  It holds no role - attaching $NODE_ROLE_NAME"
+                    Invoke-AwsCmd "aws iam add-role-to-instance-profile --instance-profile-name `"$PROFILE_NAME`" --role-name `"$NODE_ROLE_NAME`"" -Silent
+                } else {
+                    Write-LogYellow "  !!  It holds '$($held -join ', ')', not $NODE_ROLE_NAME."
+                }
+            }
+        } else {
+            Write-LogGray "  Creating instance profile $PROFILE_NAME..."
+            Invoke-AwsCmd "aws iam create-instance-profile --instance-profile-name `"$PROFILE_NAME`" --tags `"Key=Owner,Value=$($s.Initials)`" `"Key=Environment,Value=$($s.Environment)`" `"Key=CreateDate,Value=$($s.CreateDate)`"" -Silent
+            Invoke-AwsCmd "aws iam add-role-to-instance-profile --instance-profile-name `"$PROFILE_NAME`" --role-name `"$NODE_ROLE_NAME`"" -Silent
+            Write-LogGreen "  OK  Created: $PROFILE_NAME (role $NODE_ROLE_NAME)"
+        }
+        $INSTANCE_PROFILE_ARN = "arn:aws:iam::${acctId}:instance-profile/$PROFILE_NAME"
+    }
+    $s.InstanceProfileArn = $INSTANCE_PROFILE_ARN
+
+    # Step 9c: S3 gateway VPC endpoint
+    #
+    # An OLH network prerequisite. AWS allows one gateway endpoint per VPC per
+    # service, so find an existing one and hand it to Terraform; otherwise
+    # leave the tfvars entry empty and let Terraform create it.
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Network: S3 gateway endpoint..."
+    $S3_VPCE_ID = ""
+    if (-not $DryRun) {
+        $vpceRaw = Invoke-AwsCmd "aws ec2 describe-vpc-endpoints --region $($s.Region) --filters `"Name=vpc-id,Values=$VPC_ID`" `"Name=service-name,Values=com.amazonaws.$($s.Region).s3`" --output json" -AsJson -Silent
+        if ($vpceRaw) {
+            $gw = @($vpceRaw.VpcEndpoints | Where-Object { $_.VpcEndpointType -eq "Gateway" })
+            if ($gw.Count -gt 0) { $S3_VPCE_ID = $gw[0].VpcEndpointId }
         }
     }
+    if ($S3_VPCE_ID) {
+        Write-LogGreen "  OK  Existing S3 gateway endpoint: $S3_VPCE_ID (Terraform will reuse it)"
+    } else {
+        Write-LogYellow "  !!  No S3 gateway endpoint in this VPC - Terraform will create one."
+    }
+    $s.S3GatewayEndpoint = $S3_VPCE_ID
 
     # Step 10: S3 Buckets
     $step++; Update-Progress ([int]($step/$totalSteps*100)) "Storage: S3 Buckets..."
@@ -2242,6 +3235,20 @@ function Start-Deploy {
     $S3_LANDING = $script:Controls['txtS3Landing'].Text
     $S3_CONFIG  = $script:Controls['txtS3Config'].Text
     $TFSTATE_BUCKET = "$PREFIX-tfstate-s3"
+
+    # The CLI never saw this as inline JSON: Windows argument parsing strips the
+    # embedded quotes, so the rule set arrived invalid and the -Silent call failed
+    # unnoticed, leaving every bucket without default encryption. Pass it as
+    # file://, like the IAM trust policies. KMSMasterKeyID pins the buckets to the
+    # OLH CMK that Terraform grants the node role envelope-encryption on;
+    # BucketKeyEnabled keeps KMS request volume down on Iceberg traffic.
+    $sseFile  = Join-Path $env:TEMP "olh-s3-sse-$PID.json"
+    $sseRules = if ($KMS_KEY_ARN) {
+        "{`"Rules`":[{`"ApplyServerSideEncryptionByDefault`":{`"SSEAlgorithm`":`"aws:kms`",`"KMSMasterKeyID`":`"$KMS_KEY_ARN`"},`"BucketKeyEnabled`":true}]}"
+    } else {
+        "{`"Rules`":[{`"ApplyServerSideEncryptionByDefault`":{`"SSEAlgorithm`":`"aws:kms`"},`"BucketKeyEnabled`":true}]}"
+    }
+    if (-not $DryRun) { Set-Content -Path $sseFile -Value $sseRules -Encoding ASCII }
 
     foreach ($bn in @($S3_ICEBERG, $S3_LANDING, $S3_CONFIG, $TFSTATE_BUCKET)) {
         $exists = Invoke-AwsCmd "aws s3api head-bucket --bucket $bn --region $($s.Region)" -Silent
@@ -2253,17 +3260,36 @@ function Start-Deploy {
             } else {
                 Write-LogGray "  Creating bucket: $bn"
                 if ($s.Region -eq "us-east-1") {
-                    Invoke-AwsCmd "aws s3api create-bucket --bucket $bn --region $($s.Region)" -Silent
+                    $mk = Invoke-AwsCmd "aws s3api create-bucket --bucket $bn --region $($s.Region)" -Silent
                 } else {
-                    Invoke-AwsCmd "aws s3api create-bucket --bucket $bn --region $($s.Region) --create-bucket-configuration `"LocationConstraint=$($s.Region)`"" -Silent
+                    $mk = Invoke-AwsCmd "aws s3api create-bucket --bucket $bn --region $($s.Region) --create-bucket-configuration `"LocationConstraint=$($s.Region)`"" -Silent
                 }
-                Invoke-AwsCmd "aws s3api put-bucket-encryption --bucket $bn --server-side-encryption-configuration '{`"Rules`":[{`"ApplyServerSideEncryptionByDefault`":{`"SSEAlgorithm`":`"aws:kms`"}}]}'" -Silent
+                if ($null -eq $mk) {
+                    # Invoke-AwsCmd returns $null only on a non-zero exit. Claiming
+                    # success here puts a bucket that does not exist into tfvars.
+                    Write-LogRed "  X   Failed to create bucket: $bn"
+                    continue
+                }
+                $encOk = $null -ne (Invoke-AwsCmd "aws s3api put-bucket-encryption --bucket $bn --server-side-encryption-configuration `"file://$sseFile`"" -Silent)
                 Invoke-AwsCmd "aws s3api put-public-access-block --bucket $bn --public-access-block-configuration `"BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true`"" -Silent
-                Invoke-AwsCmd "aws s3api put-bucket-tagging --bucket $bn --tagging `"TagSet=[{Key=Owner,Value=$($s.Initials)},{Key=Environment,Value=$($s.Environment)},{Key=Workload,Value=qlik-olh},{Key=CreateDate,Value=$($s.CreateDate)},{Key=ManagedBy,Value=script}]`"" -Silent
-                Write-LogGreen "  OK  Created: $bn (KMS-encrypted, tagged)"
+                $tagOk = $null -ne (Invoke-AwsCmd "aws s3api put-bucket-tagging --bucket $bn --tagging `"TagSet=[{Key=Owner,Value=$($s.Initials)},{Key=Environment,Value=$($s.Environment)},{Key=Workload,Value=qlik-olh},{Key=CreateDate,Value=$($s.CreateDate)},{Key=ManagedBy,Value=script}]`"" -Silent)
+                if ($bn -eq $TFSTATE_BUCKET) {
+                    # Terraform state benefits from versioning; the lakehouse buckets do not.
+                    Invoke-AwsCmd "aws s3api put-bucket-versioning --bucket $TFSTATE_BUCKET --versioning-configuration Status=Enabled" -Silent
+                }
+                $encNote = if ($KMS_KEY_ARN) { "CMK-encrypted" } else { "KMS-encrypted" }
+                if ($encOk -and $tagOk) {
+                    Write-LogGreen "  OK  Created: $bn ($encNote, tagged)"
+                } else {
+                    $missing = @()
+                    if (-not $encOk) { $missing += "encryption NOT applied" }
+                    if (-not $tagOk) { $missing += "tags NOT applied" }
+                    Write-LogYellow "  !!  Created: $bn ($($missing -join '; '))"
+                }
             }
         }
     }
+    Remove-Item $sseFile -Force -ErrorAction SilentlyContinue
 
     # Step 11: Kinesis Stream
     $step++; Update-Progress ([int]($step/$totalSteps*100)) "Storage: Kinesis Stream..."
@@ -2275,7 +3301,7 @@ function Start-Deploy {
         if ($DryRun) {
             Write-LogYellow "  [DRY-RUN] Would create Kinesis stream: $KINESIS_NAME"
         } else {
-            Invoke-AwsCmd "aws kinesis create-stream --stream-name $KINESIS_NAME --shard-count 2 --region $($s.Region)" -Silent
+            Invoke-AwsCmd "aws kinesis create-stream --stream-name $KINESIS_NAME --shard-count 1 --region $($s.Region)" -Silent
             Invoke-AwsCmd "aws kinesis add-tags-to-stream --stream-name $KINESIS_NAME --region $($s.Region) --tags `"Owner=$($s.Initials),Environment=$($s.Environment),Workload=qlik-olh,CreateDate=$($s.CreateDate)`"" -Silent
             Write-LogGreen "  OK  Created: $KINESIS_NAME"
         }
@@ -2306,28 +3332,43 @@ function Start-Deploy {
     }) -join "`n"
 
     $modeComment = if ($DryRun) { "DRY-RUN" } else { "LIVE" }
-    $tfvarsPath = Join-Path $PWD "terraform.tfvars"
+    $tfDir = Get-TerraformDir
+    if (-not (Test-Path -LiteralPath $tfDir)) { New-Item -ItemType Directory -Path $tfDir -Force | Out-Null }
+    $tfvarsPath = Join-Path $tfDir "terraform.tfvars"
+    $subnetIdsHcl = "[" + (($subnetAzPairs | ForEach-Object { '"' + $_.Subnet + '"' }) -join ", ") + "]"
 
     @"
 # Generated by qlik_deploy_olh_gui.ps1
 # $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
 # Mode: $modeComment
 
-initials             = "$($s.Initials)"
-workload             = "$($s.Workload)"
-env                  = "$($s.Environment)"
-aws_region           = "$($s.Region)"
-aws_account_id       = "$acctId"
-tfstate_bucket       = "$TFSTATE_BUCKET"
-vpc_id               = "$VPC_ID"
-vpc_cidr             = "$VPC_CIDR"
-kinesis_stream_name  = "$KINESIS_NAME"
-kinesis_shards       = 2
-s3_bucket_name       = "$S3_ICEBERG"
-security_group_id    = "$SG_ID"
-kms_key_arn          = "$KMS_KEY_ARN"
-mgmt_role_arn        = "$MGMT_ROLE_ARN"
-instance_profile_arn = "$INSTANCE_PROFILE_ARN"
+# Contains your QTC ExternalId. Keep it out of source control.
+
+initials               = "$($s.Initials)"
+workload               = "$($s.Workload)"
+env                    = "$($s.Environment)"
+aws_region             = "$($s.Region)"
+aws_account_id         = "$acctId"
+tfstate_bucket         = "$TFSTATE_BUCKET"
+
+vpc_id                 = "$VPC_ID"
+vpc_cidr               = "$VPC_CIDR"
+subnet_ids             = $subnetIdsHcl
+security_group_id      = "$SG_ID"
+s3_gateway_endpoint_id = "$S3_VPCE_ID"
+
+kms_key_arn            = "$KMS_KEY_ARN"
+mgmt_role_arn          = "$MGMT_ROLE_ARN"
+node_role_arn          = "$NODE_ROLE_ARN"
+instance_profile_arn   = "$INSTANCE_PROFILE_ARN"
+qlik_proxy_role_arn    = "$($s.QlikProxyRoleArn)"
+qtc_external_id        = "$($s.QtcExternalId)"
+
+s3_bucket_name         = "$S3_ICEBERG"
+s3_landing_bucket      = "$S3_LANDING"
+s3_config_bucket       = "$S3_CONFIG"
+kinesis_stream_name    = "$KINESIS_NAME"
+kinesis_shards         = 1
 
 # Tags
 tag_owner      = "$($s.Initials)"
@@ -2338,7 +3379,7 @@ tag_createdate = "$($s.CreateDate)"
     Write-LogGreen "  OK  terraform.tfvars"
 
     # QTC Reference file
-    $qtcFile = Join-Path $PWD "qlik-network-integration.txt"
+    $qtcFile = Join-Path $script:ScriptDir "qlik-network-integration.txt"
     $sep55 = "-" * 55
     $eq64  = "=" * 64
 
@@ -2364,7 +3405,9 @@ $subnetBlock
   S3 Bucket Name               : $S3_ICEBERG
   Kinesis Stream Name          : $KINESIS_NAME
   Security Group ID            : $SG_ID
+  S3 Gateway VPC Endpoint      : $(if ($S3_VPCE_ID) { $S3_VPCE_ID } else { "created by Terraform" })
   Management Role ARN          : $MGMT_ROLE_ARN
+  Node Role ARN                : $NODE_ROLE_ARN
   Instance Profile ARN         : $INSTANCE_PROFILE_ARN
 $sep55
 
@@ -2391,7 +3434,7 @@ $sep55
     Write-LogGreen "  OK  qlik-network-integration.txt"
 
     # HTML Report
-    $rptFile = Join-Path $PWD "deploy-report.html"
+    $rptFile = Join-Path $script:ScriptDir "deploy-report.html"
     $snHtml = ($subnetAzPairs | ForEach-Object {
         "<div class='v'>Subnet: $($_.Subnet) / AZ: $($_.AZ)</div>"
     }) -join ""
@@ -2419,8 +3462,8 @@ h1 small{font-size:12px;opacity:.8;display:block;margin-top:4px}
   <small>Prefix: $PREFIX | Region: $($s.Region) | $(Get-Date)</small>
 </h1>
 <div class="section"><h2>Status</h2><div class="chips">
-  <span class="chip ok">Deployment Complete</span>
-  <span class="chip ok">Tags Compliant</span>
+  <span class="chip warn">Prerequisites Provisioned - Terraform Pending</span>
+  <span class="chip $(if ($allCompliant) { 'ok' } else { 'warn' })">$(if ($allCompliant) { 'Tags Compliant' } else { 'Tags Incomplete' })</span>
   <span class="chip $(if ($DryRun) { 'warn' } else { 'ok' })">$(if ($DryRun) { 'Dry-Run Mode' } else { 'Live Mode' })</span>
 </div></div>
 <div class="section"><h2>Network</h2><div class="grid">
@@ -2461,65 +3504,9 @@ h1 small{font-size:12px;opacity:.8;display:block;margin-top:4px}
     # Step 14: Terraform
     $step++; Update-Progress ([int]($step/$totalSteps*100)) "Terraform..."
     if (-not $DryRun -and $script:State.TerraformOk) {
-        Write-Log "`n  -- Terraform --" -Bold $true
-        Write-LogGray "  -> terraform init"
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = "terraform"
-        $psi.Arguments = "init -reconfigure -backend-config=`"bucket=$TFSTATE_BUCKET`" -backend-config=`"key=qlik-lakehouse/terraform.tfstate`" -backend-config=`"region=$($s.Region)`""
-        $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
-        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
-        $psi.WorkingDirectory = $PWD.Path
-        $proc = [System.Diagnostics.Process]::Start($psi)
-        $outTask = $proc.StandardOutput.ReadToEndAsync()
-        $errTask = $proc.StandardError.ReadToEndAsync()
-        $proc.WaitForExit()
-        $null = $outTask.Result
-        if ($proc.ExitCode -eq 0) {
-            Write-LogGreen "  OK  terraform init complete"
-            Write-LogGray "  -> terraform plan"
-            $psi2 = New-Object System.Diagnostics.ProcessStartInfo
-            $psi2.FileName = "terraform"
-            $psi2.Arguments = "plan -var-file=`"$tfvarsPath`" -out=`"tfplan`""
-            $psi2.RedirectStandardOutput = $true; $psi2.RedirectStandardError = $true
-            $psi2.UseShellExecute = $false; $psi2.CreateNoWindow = $true
-            $psi2.WorkingDirectory = $PWD.Path
-            $proc2 = [System.Diagnostics.Process]::Start($psi2)
-            $outTask2 = $proc2.StandardOutput.ReadToEndAsync()
-            $errTask2 = $proc2.StandardError.ReadToEndAsync()
-            $proc2.WaitForExit()
-            $null = $outTask2.Result
-            if ($proc2.ExitCode -eq 0) {
-                Write-LogGreen "  OK  terraform plan saved to tfplan"
-                $r = [System.Windows.Forms.MessageBox]::Show("Terraform plan is ready. Apply now?", "Terraform Apply", 'YesNo', 'Question')
-                if ($r -eq 'Yes') {
-                    Write-LogGray "  -> terraform apply tfplan"
-                    $psi3 = New-Object System.Diagnostics.ProcessStartInfo
-                    $psi3.FileName = "terraform"; $psi3.Arguments = "apply `"tfplan`""
-                    $psi3.RedirectStandardOutput = $true; $psi3.RedirectStandardError = $true
-                    $psi3.UseShellExecute = $false; $psi3.CreateNoWindow = $true
-                    $psi3.WorkingDirectory = $PWD.Path
-                    $proc3 = [System.Diagnostics.Process]::Start($psi3)
-                    $outTask3 = $proc3.StandardOutput.ReadToEndAsync()
-                    $errTask3 = $proc3.StandardError.ReadToEndAsync()
-                    $proc3.WaitForExit()
-                    $null = $outTask3.Result
-                    if ($proc3.ExitCode -eq 0) { Write-LogGreen "  OK  terraform apply complete!" }
-                    else {
-                        Write-LogRed "  X  terraform apply failed (exit $($proc3.ExitCode))"
-                        $e3 = $errTask3.Result
-                        if ($e3) { Write-LogRed ("  " + (($e3.Trim() -split "`n" | Select-Object -First 8) -join "`n  ")) }
-                    }
-                }
-            } else {
-                Write-LogRed "  X  terraform plan failed (exit $($proc2.ExitCode))"
-                $e2 = $errTask2.Result
-                if ($e2) { Write-LogRed ("  " + (($e2.Trim() -split "`n" | Select-Object -First 8) -join "`n  ")) }
-            }
-        } else {
-            Write-LogRed "  X  terraform init failed (exit $($proc.ExitCode))"
-            $e1 = $errTask.Result
-            if ($e1) { Write-LogRed ("  " + (($e1.Trim() -split "`n" | Select-Object -First 8) -join "`n  ")) }
-        }
+        Write-Log "`n  -- Terraform ($tfDir) --" -Bold $true
+        $initArgs = "init -reconfigure -backend-config=`"bucket=$TFSTATE_BUCKET`" -backend-config=`"key=qlik-lakehouse/terraform.tfstate`" -backend-config=`"region=$($s.Region)`""
+        Invoke-TerraformFlow -WorkDir $tfDir -InitArgs $initArgs
     } elseif ($DryRun) {
         Write-LogYellow "  [DRY-RUN] Terraform steps skipped"
     } else {
@@ -2547,16 +3534,495 @@ function Deploy-Complete {
 
 #endregion
 
+#region ── Google Cloud deployment ────────────────────────────
+
+function Populate-SummaryGcp {
+    $s = $script:State
+    $rtb = $script:Controls['rtbSummary']
+    $rtb.Clear()
+
+    $modeLabel = switch ($s.Mode) {
+        "Deploy"   { "LIVE DEPLOY" }
+        "DryRun"   { "DRY-RUN (no changes)" }
+        default    { "LIVE DEPLOY" }
+    }
+
+    $text = @"
+  Cloud:          Google Cloud  (Private Preview)
+  Mode:           $modeLabel
+  Prefix:         $($s.Prefix)
+  Project:        $($s.GcpProjectId)  (number $($s.GcpProjectNumber))
+  Region:         $($s.Region)
+  Zones:          $($s.GcpZones -join ', ')
+  Date:           $($s.CreateDate)
+
+  --- Network ---
+  VPC network:    $($s.NetworkName)
+  Subnetwork:     $($s.SubnetworkName)  $($s.SubnetworkCidr)
+  Private Google Access: $(if ($s.PrivateGoogleAccess) { 'on' } else { 'OFF - will be enabled' })
+  Firewall rule:  $($s.FirewallRule)
+  Cloud NAT:      $($s.NatName) via $($s.NatRouter)
+
+  --- Security ---
+  KMS key:        $($s.GcpKmsKeyId)
+  Management SA:  $($s.MgmtServiceAccount)
+  Node SA:        $($s.NodeServiceAccount)
+  QTC tenant:     $($s.QtcTenantId)
+  QTC auth:       $($s.QtcAuthMethod)
+
+  --- Storage ---
+  Table storage:  $($s.GcsTable)
+  Landing:        $($s.GcsLanding)
+  Config:         $($s.GcsConfig)
+  TF state:       $($s.GcsTfState)
+  Streaming:      none - Private Preview covers CDC and SaaS sources
+
+  --- Created by Terraform ---
+  BigLake catalog:  $($s.Initials)_$($s.Workload)_$($s.Environment)_catalog
+  BigLake database: $($s.Initials)_$($s.Workload)_$($s.Environment)_db
+  BigQuery mirror:  $($s.Initials)_$($s.Workload)_$($s.Environment)_mirror
+"@
+    $rtb.Text = $text
+
+    $dgv = $script:Controls['dgvTags']
+    $dgv.Rows.Clear()
+    $labels = [ordered]@{
+        owner       = $s.Initials
+        environment = $s.Environment
+        workload    = "qlik-olh"
+        application = "open-lakehouse"
+        createdate  = $s.CreateDate
+        managedby   = "script"
+    }
+    foreach ($k in $labels.Keys) {
+        $v = $labels[$k]
+        $status = if ($v) { "Compliant" } else { "Missing" }
+        $dgv.Rows.Add($k, $v, $status) | Out-Null
+    }
+}
+
+function Start-DeployGcp {
+    $s = $script:State
+    $s.Deploying = $true
+    $DryRun = ($s.Mode -eq "DryRun")
+    $PREFIX = $s.Prefix
+    $proj   = $s.GcpProjectId
+    $region = $s.Region
+
+    $script:Controls['rtbLog'].Clear()
+    Write-LogCyan "  Qlik Open Lakehouse - Google Cloud deployment"
+    Write-LogYellow "  Private Preview (opened 2 Sep 2026). Scope: CDC and SaaS sources."
+    Write-Log ""
+
+    $totalSteps = 11
+    $step = 0
+
+    # ── APIs ──
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Enabling required APIs..."
+    Write-Log "  -- Required APIs --" -Bold $true
+    $apis = @(
+        "compute.googleapis.com", "storage.googleapis.com", "cloudkms.googleapis.com",
+        "secretmanager.googleapis.com", "biglake.googleapis.com", "bigquery.googleapis.com",
+        "iam.googleapis.com", "iamcredentials.googleapis.com", "sts.googleapis.com"
+    )
+    if ($DryRun) {
+        Write-LogYellow "  [DRY-RUN] Would enable $($apis.Count) APIs"
+    } else {
+        $r = Invoke-GcloudCmd "gcloud services enable $($apis -join ' ') --project=$proj"
+        if ($null -ne $r) { Write-LogGreen "  OK  $($apis.Count) API(s) enabled" }
+        else { Write-LogYellow "  !!  Could not enable every API - you may lack serviceusage.services.enable" }
+    }
+
+    # ── VPC network ──
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Network: VPC..."
+    Write-Log "`n  -- Network --" -Bold $true
+    $net = $s.NetworkName
+    if ($script:Controls['chkGcpNewNetwork'].Checked) {
+        if ($DryRun) {
+            Write-LogYellow "  [DRY-RUN] Would create network $net"
+        } else {
+            $exists = Invoke-GcloudCmd "gcloud compute networks describe $net --project=$proj --format=json" -AsJson -Silent
+            if ($exists) {
+                Write-LogGreen "  OK  Network already exists: $net"
+            } else {
+                Invoke-GcloudCmd "gcloud compute networks create $net --project=$proj --subnet-mode=custom" -Silent
+                Write-LogGreen "  OK  Created network: $net"
+            }
+        }
+    } else {
+        Write-LogGreen "  OK  Using network: $net"
+    }
+
+    # ── Subnetwork ──
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Network: Subnetwork..."
+    $sub  = $s.SubnetworkName
+    $cidr = $s.SubnetworkCidr
+    if ($script:Controls['chkGcpNewSubnet'].Checked) {
+        if ($DryRun) {
+            Write-LogYellow "  [DRY-RUN] Would create subnetwork $sub ($cidr) with Private Google Access"
+        } else {
+            $exists = Invoke-GcloudCmd "gcloud compute networks subnets describe $sub --project=$proj --region=$region --format=json" -AsJson -Silent
+            if ($exists) {
+                Write-LogGreen "  OK  Subnetwork already exists: $sub"
+            } else {
+                Invoke-GcloudCmd "gcloud compute networks subnets create $sub --project=$proj --network=$net --region=$region --range=$cidr --enable-private-ip-google-access" -Silent
+                Write-LogGreen "  OK  Created subnetwork: $sub ($cidr, Private Google Access on)"
+            }
+            $s.PrivateGoogleAccess = $true
+        }
+    } else {
+        Write-LogGreen "  OK  Using subnetwork: $sub ($cidr)"
+        # Private Google Access is the counterpart of the S3 gateway endpoint
+        # on AWS. Terraform refuses to plan without it, so fix it here.
+        if (-not $s.PrivateGoogleAccess -and -not $DryRun) {
+            Write-LogYellow "  !!  Private Google Access is off - enabling"
+            $r = Invoke-GcloudCmd "gcloud compute networks subnets update $sub --project=$proj --region=$region --enable-private-ip-google-access" -Silent
+            if ($null -ne $r) {
+                $s.PrivateGoogleAccess = $true
+                Write-LogGreen "  OK  Private Google Access enabled"
+            } else {
+                Write-LogRed "  X   Could not enable Private Google Access - Terraform will refuse to plan"
+            }
+        }
+    }
+
+    # ── Cloud Router and NAT ──
+    # Cluster nodes run without external IPs. Private Google Access covers
+    # Google APIs; Cloud NAT is what lets the agent reach Qlik Talend Cloud,
+    # which is the role the Internet Gateway plays on AWS.
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Network: Cloud NAT..."
+    if ($DryRun) {
+        Write-LogYellow "  [DRY-RUN] Would create Cloud Router $($s.NatRouter) and NAT $($s.NatName)"
+    } else {
+        $rtr = Invoke-GcloudCmd "gcloud compute routers describe $($s.NatRouter) --project=$proj --region=$region --format=json" -AsJson -Silent
+        if ($rtr) {
+            Write-LogGreen "  OK  Cloud Router exists: $($s.NatRouter)"
+        } else {
+            Invoke-GcloudCmd "gcloud compute routers create $($s.NatRouter) --project=$proj --network=$net --region=$region" -Silent
+            Write-LogGreen "  OK  Created Cloud Router: $($s.NatRouter)"
+        }
+        $nat = Invoke-GcloudCmd "gcloud compute routers nats describe $($s.NatName) --router=$($s.NatRouter) --project=$proj --region=$region --format=json" -AsJson -Silent
+        if ($nat) {
+            Write-LogGreen "  OK  Cloud NAT exists: $($s.NatName)"
+        } else {
+            Invoke-GcloudCmd "gcloud compute routers nats create $($s.NatName) --router=$($s.NatRouter) --project=$proj --region=$region --auto-allocate-nat-external-ip --nat-all-subnet-ip-ranges" -Silent
+            Write-LogGreen "  OK  Created Cloud NAT: $($s.NatName)"
+        }
+    }
+
+    # ── Firewall ──
+    # The counterpart of the OLH security group: all traffic from inside the
+    # subnet. Egress needs no rule - GCP has an implied default-allow-egress.
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Network: Firewall..."
+    if ($DryRun) {
+        Write-LogYellow "  [DRY-RUN] Would create firewall rule $($s.FirewallRule) (ingress from $cidr)"
+    } else {
+        $fw = Invoke-GcloudCmd "gcloud compute firewall-rules describe $($s.FirewallRule) --project=$proj --format=json" -AsJson -Silent
+        if ($fw) {
+            Write-LogGreen "  OK  Firewall rule exists: $($s.FirewallRule)"
+        } else {
+            Invoke-GcloudCmd "gcloud compute firewall-rules create $($s.FirewallRule) --project=$proj --network=$net --direction=INGRESS --action=ALLOW --rules=tcp:0-65535 --source-ranges=$cidr --description=`"Qlik Open Lakehouse intra-cluster traffic`"" -Silent
+            Write-LogGreen "  OK  Created firewall rule: $($s.FirewallRule) (ingress from $cidr)"
+        }
+    }
+
+    # ── Cloud KMS ──
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Security: Cloud KMS..."
+    Write-Log "`n  -- Security and Encryption --" -Bold $true
+    $ring = $s.GcpKmsKeyRing
+    $key  = $s.GcpKmsKeyName
+    if ($DryRun) {
+        Write-LogYellow "  [DRY-RUN] Would create key ring $ring and key $key"
+    } else {
+        $kr = Invoke-GcloudCmd "gcloud kms keyrings describe $ring --project=$proj --location=$region --format=json" -AsJson -Silent
+        if ($kr) { Write-LogGreen "  OK  Key ring exists: $ring" }
+        else {
+            Invoke-GcloudCmd "gcloud kms keyrings create $ring --project=$proj --location=$region" -Silent
+            Write-LogGreen "  OK  Created key ring: $ring"
+        }
+        $ck = Invoke-GcloudCmd "gcloud kms keys describe $key --project=$proj --location=$region --keyring=$ring --format=json" -AsJson -Silent
+        if ($ck) { Write-LogGreen "  OK  Key exists: $key" }
+        else {
+            Invoke-GcloudCmd "gcloud kms keys create $key --project=$proj --location=$region --keyring=$ring --purpose=encryption" -Silent
+            Write-LogGreen "  OK  Created key: $key"
+        }
+        Write-LogGray "      $($s.GcpKmsKeyId)"
+
+        # Cloud Storage cannot write CMEK-encrypted objects until its own
+        # service agent can use the key. Without this, bucket creation with
+        # --default-encryption-key fails with an error that does not name the
+        # cause.
+        $agent = Invoke-GcloudCmd "gcloud storage service-agent --project=$proj" -Silent
+        if ($agent) {
+            $agent = ($agent -split "`n")[0].Trim()
+            Invoke-GcloudCmd "gcloud kms keys add-iam-policy-binding $key --project=$proj --location=$region --keyring=$ring --member=`"serviceAccount:$agent`" --role=`"roles/cloudkms.cryptoKeyEncrypterDecrypter`"" -Silent
+            Write-LogGreen "  OK  Storage service agent can use the key"
+        } else {
+            Write-LogYellow "  !!  Could not resolve the Cloud Storage service agent"
+        }
+    }
+
+    # ── Service accounts ──
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Security: Service accounts..."
+    $mgmtId = ($s.MgmtServiceAccount -split '@')[0]
+    $nodeId = ($s.NodeServiceAccount -split '@')[0]
+    foreach ($pair in @(@($mgmtId, $s.MgmtServiceAccount, "Qlik OLH management ($PREFIX)"),
+                        @($nodeId, $s.NodeServiceAccount, "Qlik OLH nodes ($PREFIX)"))) {
+        if ($DryRun) {
+            Write-LogYellow "  [DRY-RUN] Would create service account $($pair[0])"
+            continue
+        }
+        $sa = Invoke-GcloudCmd "gcloud iam service-accounts describe $($pair[1]) --project=$proj --format=json" -AsJson -Silent
+        if ($sa) {
+            Write-LogGreen "  OK  Service account exists: $($pair[1])"
+        } else {
+            Invoke-GcloudCmd "gcloud iam service-accounts create $($pair[0]) --project=$proj --display-name=`"$($pair[2])`"" -Silent
+            Write-LogGreen "  OK  Created: $($pair[1])"
+        }
+    }
+
+    # Project roles the management account needs to stand up and run the
+    # cluster. Terraform adds the narrower, resource-scoped grants.
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Security: Management roles..."
+    $mgmtRoles = @("roles/compute.instanceAdmin.v1", "roles/compute.networkUser", "roles/iam.serviceAccountUser")
+    foreach ($role in $mgmtRoles) {
+        if ($DryRun) { Write-LogYellow "  [DRY-RUN] Would grant $role"; continue }
+        $r = Invoke-GcloudCmd "gcloud projects add-iam-policy-binding $proj --member=`"serviceAccount:$($s.MgmtServiceAccount)`" --role=`"$role`" --condition=None" -Silent
+        if ($null -ne $r) { Write-LogGreen "  OK  Granted $role" }
+        else { Write-LogYellow "  !!  Could not grant $role" }
+    }
+
+    # ── Cloud Storage buckets ──
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Storage: Cloud Storage buckets..."
+    Write-Log "`n  -- Storage --" -Bold $true
+    $labels = Build-GcpLabels
+    foreach ($b in @(@($s.GcsTable, $true), @($s.GcsLanding, $true), @($s.GcsConfig, $true), @($s.GcsTfState, $false))) {
+        $bn   = $b[0]
+        $cmek = $b[1]
+        if ($DryRun) { Write-LogYellow "  [DRY-RUN] Would create bucket: $bn"; continue }
+        $exists = Invoke-GcloudCmd "gcloud storage buckets describe gs://$bn --project=$proj --format=json" -AsJson -Silent
+        if ($exists) {
+            Write-LogGreen "  OK  Bucket exists: $bn"
+            continue
+        }
+        $enc = if ($cmek) { "--default-encryption-key=$($s.GcpKmsKeyId)" } else { "" }
+        Invoke-GcloudCmd "gcloud storage buckets create gs://$bn --project=$proj --location=$region --uniform-bucket-level-access --public-access-prevention $enc" -Silent
+        Invoke-GcloudCmd "gcloud storage buckets update gs://$bn --project=$proj --update-labels=$labels" -Silent
+        $encNote = if ($cmek) { "CMEK" } else { "Google-managed encryption" }
+        Write-LogGreen "  OK  Created: $bn ($encNote, uniform access, public access prevented)"
+    }
+    if (-not $DryRun) {
+        # Terraform state benefits from versioning; the lakehouse buckets do not.
+        Invoke-GcloudCmd "gcloud storage buckets update gs://$($s.GcsTfState) --project=$proj --versioning" -Silent
+    }
+
+    # ── Label compliance ──
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Verifying label compliance..."
+    Write-Log "`n  -- Label Compliance --" -Bold $true
+    $required = [ordered]@{
+        owner = $s.Initials; environment = $s.Environment; workload = "qlik-olh"
+        application = "open-lakehouse"; createdate = $s.CreateDate; managedby = "script"
+    }
+    $ok = $true
+    foreach ($k in $required.Keys) {
+        if ($required[$k]) { Write-LogGreen "  OK  $k = $($required[$k])" }
+        else { Write-LogRed "  X   $k = (empty)"; $ok = $false }
+    }
+    if ($ok) { Write-LogGreen "  OK  All labels compliant" } else { Write-LogRed "  X  Label compliance failed!" }
+
+    # ── Output files ──
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Writing output files..."
+    Write-Log "`n  -- Output Files --" -Bold $true
+    $modeComment = if ($DryRun) { "DRY-RUN" } else { "LIVE" }
+    $tfDir = Get-TerraformDir
+    if (-not (Test-Path -LiteralPath $tfDir)) { New-Item -ItemType Directory -Path $tfDir -Force | Out-Null }
+    $tfvarsPath = Join-Path $tfDir "terraform.tfvars"
+    $zonesHcl = "[" + (($s.GcpZones | ForEach-Object { '"' + $_ + '"' }) -join ", ") + "]"
+
+    @"
+# Generated by qlik_deploy_olh_gui.ps1
+# $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+# Cloud: Google Cloud   Mode: $modeComment
+#
+# Contains your QTC tenant ID. Keep it out of source control.
+
+initials                   = "$($s.Initials)"
+workload                   = "$($s.Workload)"
+env                        = "$($s.Environment)"
+
+gcp_project_id             = "$($s.GcpProjectId)"
+gcp_project_number         = "$($s.GcpProjectNumber)"
+gcp_region                 = "$region"
+gcp_zones                  = $zonesHcl
+tfstate_bucket             = "$($s.GcsTfState)"
+
+network_name               = "$net"
+subnetwork_name            = "$sub"
+subnetwork_cidr            = "$cidr"
+firewall_rule_name         = "$($s.FirewallRule)"
+
+kms_key_id                 = "$($s.GcpKmsKeyId)"
+mgmt_service_account_email = "$($s.MgmtServiceAccount)"
+node_service_account_email = "$($s.NodeServiceAccount)"
+
+qtc_auth_method            = "$($s.QtcAuthMethod)"
+qtc_oidc_issuer_uri        = "$($s.QtcOidcIssuer)"
+qtc_tenant_id              = "$($s.QtcTenantId)"
+
+gcs_table_bucket           = "$($s.GcsTable)"
+gcs_landing_bucket         = "$($s.GcsLanding)"
+gcs_config_bucket          = "$($s.GcsConfig)"
+
+# Labels
+tag_owner      = "$($s.Initials)"
+tag_env        = "$($s.Environment)"
+tag_workload   = "qlik-olh"
+tag_createdate = "$($s.CreateDate)"
+"@ | Set-Content -Path $tfvarsPath -Encoding UTF8
+    Write-LogGreen "  OK  $tfvarsPath"
+
+    $qtcFile = Join-Path $script:ScriptDir "qlik-network-integration.txt"
+    $sep55 = "-" * 55
+    $eq64  = "=" * 64
+    @"
+$eq64
+  Qlik Open Lakehouse -- QTC Network Integration Reference
+  Cloud      : Google Cloud  (Private Preview)
+  Generated  : $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+  Prefix     : $PREFIX
+  Mode       : $modeComment
+$eq64
+
+$sep55
+  ENTITY                         VALUE
+$sep55
+  Project ID                   : $($s.GcpProjectId)
+  Project Number               : $($s.GcpProjectNumber)
+  Region                       : $region
+  Zones                        : $($s.GcpZones -join ', ')
+  VPC Network                  : $net
+  Subnetwork                   : $sub
+  Subnetwork CIDR              : $cidr
+  Firewall Rule                : $($s.FirewallRule)
+  Cloud NAT                    : $($s.NatName)
+  Cloud KMS Key                : $($s.GcpKmsKeyId)
+  Management Service Account   : $($s.MgmtServiceAccount)
+  Node Service Account         : $($s.NodeServiceAccount)
+  GCS Table Storage Bucket     : $($s.GcsTable)
+  GCS Landing Bucket           : $($s.GcsLanding)
+  GCS Config Bucket            : $($s.GcsConfig)
+  QTC Auth Method              : $($s.QtcAuthMethod)
+$sep55
+
+  APPLIED LABELS
+$sep55
+  owner         : $($s.Initials)
+  environment   : $($s.Environment)
+  workload      : qlik-olh
+  application   : open-lakehouse
+  createdate    : $($s.CreateDate)
+  managedby     : script
+$sep55
+
+  CREATED BY TERRAFORM
+$sep55
+  BigLake Catalog  : $($s.Initials)_$($s.Workload)_$($s.Environment)_catalog
+  BigLake Database : $($s.Initials)_$($s.Workload)_$($s.Environment)_db
+  BigQuery Mirror  : $($s.Initials)_$($s.Workload)_$($s.Environment)_mirror
+  Secret prefix    : $($s.Initials)-$($s.Workload)-$($s.Environment)
+$sep55
+
+  PREVIEW NOTES
+$sep55
+  * Private Preview opened 2 Sep 2026; GA planned Q4 2026.
+  * Ingestion scope at launch: CDC and SaaS sources only.
+    Streaming (Kafka / GCS) and Qlik Replicate sources arrive later.
+  * Zero-copy mirroring to BigQuery is a Google Cloud only feature.
+  * The QTC authentication model on GCP is not yet published. This run
+    configured '$($s.QtcAuthMethod)' - confirm it against your preview
+    onboarding pack before treating it as final.
+$sep55
+"@ | Set-Content -Path $qtcFile -Encoding UTF8
+    Write-LogGreen "  OK  qlik-network-integration.txt"
+
+    # ── Terraform ──
+    $step++; Update-Progress ([int]($step/$totalSteps*100)) "Terraform..."
+    if (-not $DryRun -and $s.TerraformOk) {
+        Write-Log "`n  -- Terraform ($tfDir) --" -Bold $true
+        $initArgs = "init -reconfigure -backend-config=`"bucket=$($s.GcsTfState)`" -backend-config=`"prefix=qlik-lakehouse`""
+        Invoke-TerraformFlow -WorkDir $tfDir -InitArgs $initArgs
+    } elseif ($DryRun) {
+        Write-LogYellow "  [DRY-RUN] Terraform steps skipped"
+    } else {
+        Write-LogYellow "  !!  Terraform not available - skipping init/plan/apply"
+    }
+
+    Update-Progress 100 "Complete"
+    Write-Log ""
+    Write-LogGreen "  Deployment finished."
+    Write-LogCyan  "  Next: create the Network Integration in QTC, then the Lakehouse Cluster"
+    Write-LogCyan  "        (Spot VM MIG across $($s.GcpZones -join ', ')), then connect the"
+    Write-LogCyan  "        Google Lakehouse Runtime Catalog."
+    Write-LogYellow "  Reminder: your tenant must be enrolled in the Google Cloud Private Preview."
+
+    $s.Deploying = $false
+    Deploy-Complete
+}
+
+#endregion
+
 #region ── Navigation ─────────────────────────────────────────
 
 $script:StepTitles = @("Welcome", "Identity", "Network", "Security", "Storage", "Deploy")
+
+function Set-Cloud {
+    param([string]$Cloud)
+
+    $script:State.Cloud = $Cloud
+    $isGcp = ($Cloud -eq "gcp")
+
+    if ($script:Controls['lblCloudNote']) {
+        if ($isGcp) {
+            $script:Controls['lblCloudNote'].Text =
+                "Private Preview opened 2 Sep 2026. CDC and SaaS sources only - streaming and Replicate come later. Your tenant must be enrolled."
+        } else {
+            $script:Controls['lblCloudNote'].Text =
+                "Provisions the VPC, KMS, IAM, S3 and Kinesis resources Open Lakehouse needs."
+        }
+    }
+
+    # Drift and teardown are implemented for AWS only.
+    foreach ($key in @('rbModeDrift','rbModeTeardown')) {
+        if ($script:Controls[$key]) {
+            $script:Controls[$key].Enabled = -not $isGcp
+            if ($isGcp -and $script:Controls[$key].Checked -and $script:Controls['rbModeDeploy']) {
+                $script:Controls['rbModeDeploy'].Checked = $true
+            }
+        }
+    }
+
+    # Swap in the matching page set. Steps 0 and 5 are shared objects, so the
+    # arrays overlap at both ends.
+    if ($script:PanelsAws -and $script:PanelsGcp) {
+        $script:Panels = if ($isGcp) { $script:PanelsGcp } else { $script:PanelsAws }
+        Set-Step 0
+    }
+
+    Write-LogCyan "  Target cloud: $(Get-CloudLabel)"
+    if ($isGcp) {
+        Write-LogYellow "  !!  Google Cloud support is in Private Preview (opened 2 Sep 2026)."
+        Write-LogGray   "      Scope: CDC and SaaS sources. No stream resource is provisioned."
+    }
+    Run-ToolCheck
+}
 
 function Set-Step {
     param([int]$Step)
     if ($Step -lt 0 -or $Step -ge $script:Panels.Count) { return }
 
-    # Hide all panels
-    foreach ($panel in $script:Panels) { $panel.Visible = $false }
+    # Hide every panel from both cloud page sets, not just the active array -
+    # otherwise a page from the other cloud can stay on screen after a switch.
+    foreach ($panel in $script:AllPanels) { $panel.Visible = $false }
 
     # Show target panel
     $script:Panels[$Step].Visible = $true
@@ -2591,6 +4057,8 @@ function Set-Step {
 
 function Validate-Step {
     param([int]$Step)
+    if ($script:State.Cloud -eq "gcp") { return (Validate-StepGcp $Step) }
+
     switch ($Step) {
         0 {
             if (-not $script:State.AwsCliOk) {
@@ -2637,8 +4105,20 @@ function Validate-Step {
                     return $false
                 }
             }
-            if ($script:State.SubnetAzPairs.Count -eq 0) {
-                [System.Windows.Forms.MessageBox]::Show("Add at least one subnet.", "Validation", 'OK', 'Warning') | Out-Null
+            # Open Lakehouse wants at least two subnets, in two different AZs.
+            # The picker accepts anything, so the rule is enforced here rather
+            # than surfacing later as a cluster that will not launch.
+            if ($script:State.SubnetAzPairs.Count -lt 2) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Open Lakehouse requires at least two subnets, in two different Availability Zones.`n`nYou have selected $($script:State.SubnetAzPairs.Count).",
+                    "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            $azs = @($script:State.SubnetAzPairs | ForEach-Object { $_.Az } | Select-Object -Unique)
+            if ($azs.Count -lt 2) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "The selected subnets are all in one Availability Zone ($($azs -join ', ')).`n`nOpen Lakehouse spreads the cluster across two AZs.",
+                    "Validation", 'OK', 'Warning') | Out-Null
                 return $false
             }
             if (-not $script:State.SgId -and -not $script:State.CreateNewSg) {
@@ -2652,10 +4132,22 @@ function Validate-Step {
                 [System.Windows.Forms.MessageBox]::Show("Select a KMS key or check 'Create New'.", "Validation", 'OK', 'Warning') | Out-Null
                 return $false
             }
-            if (-not $script:State.MgmtRoleArn -and -not $script:State.CreateNewRole) {
-                [System.Windows.Forms.MessageBox]::Show("Select an IAM role or check 'Create New'.", "Validation", 'OK', 'Warning') | Out-Null
+            $ext = $script:Controls['txtQtcExternalId'].Text.Trim()
+            if ($ext -notmatch '^[A-Za-z0-9_.:/=+\-]{4,1224}$') {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Enter the ExternalId from your QTC tenant.`n`nIt is what the management role's trust policy requires; without it Qlik cannot assume the role and the network integration will not connect.",
+                    "Validation", 'OK', 'Warning') | Out-Null
                 return $false
             }
+            $proxy = $script:Controls['txtQlikProxyArn'].Text.Trim()
+            if ($proxy -notmatch '^arn:aws[a-z\-]*:iam::[0-9]{12}:(role|user)/.+$') {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Enter the Qlik proxy principal ARN, e.g.`narn:aws:iam::<qlik-account>:role/qlik-proxy-assume-role",
+                    "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            $script:State.QtcExternalId    = $ext
+            $script:State.QlikProxyRoleArn = $proxy
             return $true
         }
         4 {
@@ -2671,6 +4163,172 @@ function Validate-Step {
                 [System.Windows.Forms.MessageBox]::Show("Invalid Kinesis stream name.", "Validation", 'OK', 'Warning') | Out-Null
                 return $false
             }
+            return $true
+        }
+    }
+    return $true
+}
+
+function Validate-StepGcp {
+    param([int]$Step)
+    switch ($Step) {
+        0 {
+            if (-not $script:State.GcloudOk) {
+                [System.Windows.Forms.MessageBox]::Show("The Google Cloud CLI is required. Click 'Check Tools' first.", "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            if (-not $script:State.TerraformOk) {
+                $r = [System.Windows.Forms.MessageBox]::Show("Terraform is not available. Deploy steps will be skipped. Continue?", "Warning", 'YesNo', 'Warning')
+                if ($r -ne 'Yes') { return $false }
+            }
+            return $true
+        }
+        1 {
+            Sync-GcpState
+            if ($script:State.Initials -notmatch '^[a-z0-9]{2,6}$') {
+                [System.Windows.Forms.MessageBox]::Show("Owner initials must be 2-6 lowercase alphanumeric characters.", "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            if ($script:State.Workload -notmatch '^[a-z0-9-]{2,10}$') {
+                [System.Windows.Forms.MessageBox]::Show("Workload must be 2-10 lowercase alphanumeric or hyphen.", "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            $reg = $script:State.Region
+            $zones = @($script:Controls['txtGcpZones'].Text -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($zones.Count -lt 2) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Enter at least two zones.`n`nOpen Lakehouse spreads the cluster's Spot VMs across zones so a reclaim in one zone cannot take it down.",
+                    "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            $bad = @($zones | Where-Object { $_ -notmatch "^$([regex]::Escape($reg))-[a-z]$" })
+            if ($bad.Count -gt 0) {
+                [System.Windows.Forms.MessageBox]::Show("These are not zones of ${reg}:`n`n$($bad -join ', ')", "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            $script:State.GcpZones = $zones
+
+            if (-not $script:State.GcpProjectId) {
+                [System.Windows.Forms.MessageBox]::Show("Connect and select a project first.", "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            return $true
+        }
+        2 {
+            $newNet = $script:Controls['chkGcpNewNetwork'].Checked
+            if (-not $newNet -and -not $script:State.NetworkName) {
+                [System.Windows.Forms.MessageBox]::Show("Select a VPC network or check 'Create new'.", "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            if ($newNet) { $script:State.NetworkName = $script:Controls['txtGcpNetworkNew'].Text.Trim() }
+
+            $newSub = $script:Controls['chkGcpNewSubnet'].Checked
+            if ($newSub) { $script:State.SubnetworkName = $script:Controls['txtGcpSubnetNew'].Text.Trim() }
+            if (-not $script:State.SubnetworkName) {
+                [System.Windows.Forms.MessageBox]::Show("Select a subnetwork or check 'Create new'.", "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
+
+            $cidr = $script:Controls['txtGcpSubnetCidr'].Text.Trim()
+            if ($cidr -notmatch '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$') {
+                [System.Windows.Forms.MessageBox]::Show("Invalid subnetwork CIDR.", "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            $script:State.SubnetworkCidr = $cidr
+
+            # Private Google Access is a prerequisite, but an existing subnet
+            # that has it off can still be fixed during deploy.
+            if (-not $newSub -and -not $script:State.PrivateGoogleAccess) {
+                $r = [System.Windows.Forms.MessageBox]::Show(
+                    "Private Google Access is off on $($script:State.SubnetworkName).`n`nOpen Lakehouse needs it, and Terraform will refuse to plan without it. Enable it during deployment?",
+                    "Private Google Access", 'YesNo', 'Warning')
+                if ($r -ne 'Yes') { return $false }
+            }
+
+            $script:State.FirewallRule = $script:Controls['txtGcpFirewall'].Text.Trim()
+            $script:State.NatRouter    = $script:Controls['txtGcpRouter'].Text.Trim()
+            $script:State.NatName      = $script:Controls['txtGcpNat'].Text.Trim()
+            foreach ($pair in @(@('firewall rule', $script:State.FirewallRule), @('Cloud Router', $script:State.NatRouter), @('Cloud NAT', $script:State.NatName))) {
+                if ($pair[1] -notmatch '^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$') {
+                    [System.Windows.Forms.MessageBox]::Show("Invalid $($pair[0]) name: $($pair[1])", "Validation", 'OK', 'Warning') | Out-Null
+                    return $false
+                }
+            }
+            return $true
+        }
+        3 {
+            $ring = $script:Controls['txtGcpKeyRing'].Text.Trim()
+            $key  = $script:Controls['txtGcpKeyName'].Text.Trim()
+            foreach ($pair in @(@('key ring', $ring), @('key', $key))) {
+                if ($pair[1] -notmatch '^[a-zA-Z0-9_-]{1,63}$') {
+                    [System.Windows.Forms.MessageBox]::Show("Invalid KMS $($pair[0]) name: $($pair[1])", "Validation", 'OK', 'Warning') | Out-Null
+                    return $false
+                }
+            }
+            $script:State.GcpKmsKeyRing = $ring
+            $script:State.GcpKmsKeyName = $key
+            $script:State.GcpKmsKeyId   = "projects/$($script:State.GcpProjectId)/locations/$($script:State.Region)/keyRings/$ring/cryptoKeys/$key"
+
+            $mgmt = $script:Controls['txtGcpMgmtSa'].Text.Trim()
+            $node = $script:Controls['txtGcpNodeSa'].Text.Trim()
+            foreach ($pair in @(@('management', $mgmt), @('node', $node))) {
+                if ($pair[1] -notmatch '^[a-z][a-z0-9-]{4,28}[a-z0-9]$') {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "Invalid $($pair[0]) service account ID: $($pair[1])`n`n6-30 characters, lowercase letters, digits and hyphens, starting with a letter.",
+                        "Validation", 'OK', 'Warning') | Out-Null
+                    return $false
+                }
+            }
+            if ($mgmt -eq $node) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "The management and node service accounts must be different identities.`n`nQTC impersonates the management account from outside the project; the node account is attached to the VMs.",
+                    "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            $script:State.MgmtServiceAccount = "$mgmt@$($script:State.GcpProjectId).iam.gserviceaccount.com"
+            $script:State.NodeServiceAccount = "$node@$($script:State.GcpProjectId).iam.gserviceaccount.com"
+
+            $tenant = $script:Controls['txtQtcTenantId'].Text.Trim()
+            if ($tenant -notmatch '^[A-Za-z0-9_.:\-]{4,128}$') {
+                [System.Windows.Forms.MessageBox]::Show("Enter your QTC tenant ID (from Administration > Network integrations).", "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            $script:State.QtcTenantId   = $tenant
+            $script:State.QtcAuthMethod = [string]$script:Controls['cboQtcAuthMethod'].SelectedItem
+
+            if ($script:State.QtcAuthMethod -eq "workload_identity") {
+                $iss = $script:Controls['txtQtcIssuer'].Text.Trim()
+                if ($iss -notmatch '^https://.+') {
+                    [System.Windows.Forms.MessageBox]::Show("The OIDC issuer must be an https URL.", "Validation", 'OK', 'Warning') | Out-Null
+                    return $false
+                }
+                $script:State.QtcOidcIssuer = $iss
+
+                # Workload Identity pool IDs are capped at 32 characters.
+                $poolId = "$($script:State.Prefix)-qtc-pool"
+                if ($poolId.Length -gt 32) {
+                    [System.Windows.Forms.MessageBox]::Show(
+                        "The Workload Identity pool ID derived from your naming ($poolId) is $($poolId.Length) characters; Google caps it at 32.`n`nShorten the initials or workload.",
+                        "Validation", 'OK', 'Warning') | Out-Null
+                    return $false
+                }
+            } else {
+                $script:State.QtcOidcIssuer = ""
+            }
+            return $true
+        }
+        4 {
+            foreach ($name in @('txtGcsTable','txtGcsLanding','txtGcsConfig','txtGcsTfState')) {
+                $val = $script:Controls[$name].Text.Trim()
+                if ($val -notmatch '^[a-z0-9][a-z0-9._\-]{1,61}[a-z0-9]$') {
+                    [System.Windows.Forms.MessageBox]::Show("Invalid Cloud Storage bucket name: $val", "Validation", 'OK', 'Warning') | Out-Null
+                    return $false
+                }
+            }
+            $script:State.GcsTable   = $script:Controls['txtGcsTable'].Text.Trim()
+            $script:State.GcsLanding = $script:Controls['txtGcsLanding'].Text.Trim()
+            $script:State.GcsConfig  = $script:Controls['txtGcsConfig'].Text.Trim()
+            $script:State.GcsTfState = $script:Controls['txtGcsTfState'].Text.Trim()
             return $true
         }
     }
@@ -2801,28 +4459,37 @@ $pnlNav.Controls.Add($btnCancel)
 $form.Controls.Add($pnlNav)
 
 # ── Build Steps and Show ──
-$script:Panels += Build-Step0
-$script:Panels += Build-Step1
-$script:Panels += Build-Step2
-$script:Panels += Build-Step3
-$script:Panels += Build-Step4
-$script:Panels += Build-Step5
+# Steps 0 and 5 are shared; steps 1-4 exist once per cloud and are swapped by
+# Set-Cloud, because the resources they collect have no useful overlap.
+$pnlStep0 = Build-Step0
+$pnlStep5 = Build-Step5
 
-foreach ($panel in $script:Panels) {
+$script:PanelsAws = @($pnlStep0, (Build-Step1), (Build-Step2), (Build-Step3), (Build-Step4), $pnlStep5)
+$script:PanelsGcp = @($pnlStep0, (Build-Step1Gcp), (Build-Step2Gcp), (Build-Step3Gcp), (Build-Step4Gcp), $pnlStep5)
+
+$script:AllPanels = @()
+foreach ($set in @($script:PanelsAws, $script:PanelsGcp)) {
+    foreach ($panel in $set) {
+        if ($script:AllPanels -notcontains $panel) { $script:AllPanels += $panel }
+    }
+}
+
+foreach ($panel in $script:AllPanels) {
     $panel.Location = [System.Drawing.Point]::new(0, 0)
     $panel.Size     = [System.Drawing.Size]::new(785, 380)
     $panel.Visible  = $false
     $pnlContent.Controls.Add($panel)
 }
 
+$script:Panels = $script:PanelsAws
 Set-Step 0
 
 # Welcome message in log
-Write-LogCyan "  Qlik Open Lakehouse - AWS Deployment Wizard"
+Write-LogCyan "  Qlik Open Lakehouse - Deployment Wizard (AWS + Google Cloud)"
 Write-LogGray "  Checking tools..."
 
-# Auto-run tool check on startup
-Run-ToolCheck
+# Seeds the cloud note, mode radios and tool check in one pass.
+Set-Cloud "aws"
 
 # Form closing guard
 $form.Add_FormClosing({

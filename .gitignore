@@ -1,7 +1,6 @@
 # ── Terraform ─────────────────────────────────────────────────────────────
 # State and backend
 .terraform/
-.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 *.tfstate.backup
@@ -45,3 +44,7 @@ Thumbs.db
 .build-instructions.js
 .merge-template.py
 .backup-*
+
+# Saved plan files written by the wizard into terraform/<cloud>/
+tfplan
+tfplan.*

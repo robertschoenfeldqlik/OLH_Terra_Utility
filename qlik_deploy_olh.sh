@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 ################################################################
-#  discover-qlik-lakehouse.sh  –  Full Edition
+#  qlik_deploy_olh.sh  –  Full Edition  (AWS + Google Cloud)
+#
+#  Provisions the cloud resources Qlik Open Lakehouse needs, then hands off to
+#  the matching Terraform root module in terraform/<cloud>/.
+#
+#  Cloud support:
+#    • AWS          GA
+#    • Google Cloud Private Preview (opened 2 Sep 2026; GA planned Q4 2026).
+#                   Preview scope is CDC and SaaS sources only - streaming
+#                   (Kafka/GCS) and Qlik Replicate sources arrive later, which
+#                   is why the GCP path provisions no stream resource.
 #
 #  Features:
 #    • Pre-flight IAM permission checker
@@ -14,10 +24,12 @@
 #    • Auto-open qlik-network-integration.txt after deploy
 #
 #  Usage:
-#    ./discover-qlik-lakehouse.sh              # normal deploy
-#    ./discover-qlik-lakehouse.sh --dry-run    # simulate only
-#    ./discover-qlik-lakehouse.sh --drift      # drift check only
-#    ./discover-qlik-lakehouse.sh --teardown   # destroy resources
+#    ./qlik_deploy_olh.sh                      # normal deploy (asks for cloud)
+#    ./qlik_deploy_olh.sh --gcp                # skip the cloud prompt
+#    ./qlik_deploy_olh.sh --cloud=aws          # same, long form
+#    ./qlik_deploy_olh.sh --dry-run            # simulate only
+#    ./qlik_deploy_olh.sh --drift              # drift check only
+#    ./qlik_deploy_olh.sh --teardown           # destroy resources
 ################################################################
 
 set -euo pipefail
@@ -31,19 +43,83 @@ OK="✔"; WRN="⚠"; ERR="✖"; ARW="→"; SEP="$(printf '─%.0s' {1..60})"
 
 #region ── Flags ────────────────────────────────────────────────
 DRY_RUN=false; TEARDOWN=false; DRIFT_ONLY=false
+CLOUD=""
 for arg in "$@"; do
   case "$arg" in
-    --dry-run)  DRY_RUN=true   ;;
-    --teardown) TEARDOWN=true  ;;
-    --drift)    DRIFT_ONLY=true;;
+    --dry-run)    DRY_RUN=true    ;;
+    --teardown)   TEARDOWN=true   ;;
+    --drift)      DRIFT_ONLY=true ;;
+    --aws)        CLOUD="aws"     ;;
+    --gcp|--gcloud|--google) CLOUD="gcp" ;;
+    --cloud=*)    CLOUD="${arg#*=}" ;;
+    -h|--help)
+      sed -n '2,40p' "$0" | sed 's/^#//'
+      exit 0 ;;
   esac
 done
+
+case "$CLOUD" in
+  ""|aws|gcp) ;;
+  *) echo "Unknown --cloud value '$CLOUD' (expected aws or gcp)." >&2; exit 1 ;;
+esac
+#endregion
+
+#region ── Target Cloud ─────────────────────────────────────────
+# Asked before the tool check so we only demand the CLI we are going to use.
+if [[ -z "$CLOUD" ]]; then
+  echo ""
+  echo -e "  ${WHT}Which cloud is this lakehouse going into?${RST}"
+  echo ""
+  echo -e "    [1] ${CYN}Amazon Web Services${RST}   ${GRY}- generally available${RST}"
+  echo -e "    [2] ${CYN}Google Cloud${RST}          ${YLW}- Private Preview${RST} ${GRY}(CDC + SaaS sources only)${RST}"
+  echo ""
+  while true; do
+    read -rp "    Select (1-2) [default: 1]: " _cloud_sel
+    _cloud_sel="${_cloud_sel:-1}"
+    case "$_cloud_sel" in
+      1) CLOUD="aws"; break ;;
+      2) CLOUD="gcp"; break ;;
+      *) echo -e "    ${RED}${ERR}  Enter 1 or 2.${RST}" ;;
+    esac
+  done
+fi
+
+if [[ "$CLOUD" == "gcp" ]]; then
+  CLOUD_LABEL="Google Cloud"
+  CLOUD_CLI="gcloud"
+  TF_DIR="terraform/gcp"
+  if $DRIFT_ONLY || $TEARDOWN; then
+    echo ""
+    echo "  --drift and --teardown are implemented for AWS only. Remove the flag,"
+    echo "  or manage the Google Cloud resources with 'terraform -chdir=terraform/gcp destroy'." >&2
+    exit 1
+  fi
+  echo ""
+  echo -e "  ${YLW}${WRN}  Qlik Open Lakehouse on Google Cloud is in Private Preview (opened 2 Sep 2026).${RST}"
+  echo -e "  ${GRY}      Preview scope: CDC and SaaS sources. Streaming (Kafka/GCS) and Qlik${RST}"
+  echo -e "  ${GRY}      Replicate sources arrive later in the preview. Your tenant must be${RST}"
+  echo -e "  ${GRY}      enrolled before a lakehouse cluster can be created.${RST}"
+else
+  CLOUD_LABEL="AWS"
+  CLOUD_CLI="aws"
+  TF_DIR="terraform/aws"
+fi
+
+# Resolve paths from the script's own location. An elevated or relocated shell
+# has a different working directory, and outputs used to land somewhere the
+# user could not find. Resolved here rather than at the output-files step so
+# --drift and --teardown, which run long before that point, see the same
+# terraform/<cloud>/terraform.tfvars.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+TF_PATH="${SCRIPT_DIR}/${TF_DIR}"
+TFVARS="${TF_PATH}/terraform.tfvars"
 #endregion
 
 #region ── Tool Check & Auto-Install ────────────────────────────
 
 TERRAFORM_OK=false
 AWS_OK=false
+GCLOUD_OK=false
 PYTHON_OK=false
 
 # ── Inline yes/no prompt (the full confirm() is defined later) ──
@@ -100,6 +176,8 @@ install_tool() {
           echo -e "  [${n}] ${GRN}Download latest Terraform zip from HashiCorp  (recommended)${RST}"
         elif [[ "$tool" == "aws" ]]; then
           echo -e "  [${n}] ${GRN}Download AWS CLI v2 installer  (recommended)${RST}"
+        elif [[ "$tool" == "gcloud" ]]; then
+          echo -e "  [${n}] ${GRN}Download the Google Cloud CLI archive  (recommended)${RST}"
         else
           echo -e "  [${n}] ${GRN}Download and install ${tool}  (recommended)${RST}"
         fi ;;
@@ -264,6 +342,56 @@ PYEOF
           return 1
         fi
 
+      elif [[ "$tool" == "gcloud" ]]; then
+        # Google publishes a versioned archive per OS/arch plus an install.sh
+        # that wires up PATH. We extract under $HOME so no sudo is needed.
+        local g_os="linux" g_arch
+        [[ "$(uname)" == "Darwin" ]] && g_os="darwin"
+        case "$(uname -m)" in
+          x86_64|amd64)  g_arch="x86_64" ;;
+          aarch64|arm64) g_arch="arm" ;;
+          *)             g_arch="x86_64" ;;
+        esac
+        [[ "$g_os" == "darwin" && "$g_arch" == "arm" ]] && g_arch="arm"
+
+        local g_url="https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-${g_os}-${g_arch}.tar.gz"
+        local g_tgz="/tmp/google-cloud-cli.tar.gz"
+        local g_dest="$HOME"
+
+        echo -e "    ${GRY}${ARW} Downloading: ${g_url}${RST}"
+        if ! curl -fSL "$g_url" -o "$g_tgz"; then
+          echo -e "    ${RED}${ERR}  Download failed (network / proxy issue?).${RST}"
+          rm -f "$g_tgz"; return 1
+        fi
+        if [[ ! -s "$g_tgz" ]]; then
+          echo -e "    ${RED}${ERR}  Downloaded archive is empty.${RST}"; rm -f "$g_tgz"; return 1
+        fi
+
+        echo -e "    ${GRY}${ARW} Extracting to ${g_dest}/google-cloud-sdk ...${RST}"
+        if ! tar -xzf "$g_tgz" -C "$g_dest"; then
+          echo -e "    ${RED}${ERR}  Extraction failed.${RST}"; rm -f "$g_tgz"; return 1
+        fi
+        rm -f "$g_tgz"
+
+        echo -e "    ${GRY}${ARW} Running install.sh (non-interactive) ...${RST}"
+        "${g_dest}/google-cloud-sdk/install.sh" --quiet --usage-reporting=false           --command-completion=true --path-update=true >/dev/null 2>&1 || true
+
+        # install.sh edits the shell rc file, which does not help this already
+        # running shell - put it on PATH directly.
+        case ":$PATH:" in
+          *":${g_dest}/google-cloud-sdk/bin:"*) ;;
+          *) export PATH="${g_dest}/google-cloud-sdk/bin:$PATH" ;;
+        esac
+
+        if command -v gcloud &>/dev/null; then
+          local g_ver; g_ver=$(gcloud version 2>/dev/null | head -1)
+          echo -e "    ${GRN}${OK}  ${g_ver} installed.${RST}"
+          return 0
+        else
+          echo -e "    ${YLW}${WRN}  Installed but 'gcloud' not on PATH. Re-open your shell and re-run.${RST}"
+          return 1
+        fi
+
       elif [[ "$tool" == "python3" ]]; then
         echo -e "    ${YLW}  python3 download not automated -- use your system package manager.${RST}"
         return 1
@@ -315,6 +443,7 @@ PYEOF
       case "$tool" in
         terraform) brew tap hashicorp/tap && brew install hashicorp/tap/terraform ;;
         aws)       brew install awscli ;;
+        gcloud)    brew install --cask google-cloud-sdk ;;
         python3)   brew install python3 ;;
       esac ;;
 
@@ -334,6 +463,12 @@ PYEOF
           echo -e "  ${GRY}  curl https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o awscliv2.zip${RST}"
           echo -e "  ${GRY}  unzip awscliv2.zip && sudo ./aws/install${RST}"
           echo -e "  ${GRY}  aws --version${RST}" ;;
+        gcloud)
+          echo -e "  ${WHT}Google Cloud CLI Manual Install:${RST}"
+          echo -e "  ${GRY}  Linux/macOS : curl https://sdk.cloud.google.com | bash${RST}"
+          echo -e "  ${GRY}  macOS (brew): brew install --cask google-cloud-sdk${RST}"
+          echo -e "  ${GRY}  Docs        : https://cloud.google.com/sdk/docs/install${RST}"
+          echo -e "  ${GRY}  gcloud version${RST}" ;;
         python3)
           echo -e "  ${WHT}Python3 Manual Install:${RST}"
           echo -e "  ${GRY}  Ubuntu/Debian : sudo apt-get install python3${RST}"
@@ -403,7 +538,11 @@ sys.exit(0 if parse('$1') < parse('$2') else 1)
 " 2>/dev/null
 }
 
-check_tool "aws"       "AWS CLI"   "YES"      "aws --version 2>&1 | head -1"  && AWS_OK=true
+if [[ "$CLOUD" == "gcp" ]]; then
+  check_tool "gcloud"  "gcloud CLI" "YES"     "gcloud version 2>/dev/null | head -1" && GCLOUD_OK=true
+else
+  check_tool "aws"     "AWS CLI"   "YES"      "aws --version 2>&1 | head -1"  && AWS_OK=true
+fi
 check_tool "terraform" "Terraform" "optional" "terraform version 2>/dev/null | head -1" && TERRAFORM_OK=true
 
 # Python check uses the detected PY (not the literal `python3` which on
@@ -423,7 +562,12 @@ echo "  $(printf '%0.s─' {1..75})"
 # Use the *_OK flags as the source of truth (not just `command -v ...`),
 # because on Windows Git Bash `command -v python3` returns 0 for the
 # Microsoft Store stub even though the stub doesn't actually run Python.
-for item in "aws:AWS_OK" "terraform:TERRAFORM_OK" "python3:PYTHON_OK"; do
+if [[ "$CLOUD" == "gcp" ]]; then
+  _tool_items=("gcloud:GCLOUD_OK" "terraform:TERRAFORM_OK" "python3:PYTHON_OK")
+else
+  _tool_items=("aws:AWS_OK" "terraform:TERRAFORM_OK" "python3:PYTHON_OK")
+fi
+for item in "${_tool_items[@]}"; do
   local_tool="${item%%:*}"
   local_var="${item##*:}"
   if [[ "$(eval echo \$$local_var)" != "true" ]]; then
@@ -493,11 +637,33 @@ if [[ "$AWS_OK" == "true" ]]; then
   fi
 fi
 
+# ── If gcloud is installed, offer a component update ─────────
+# gcloud carries its own updater, so there is no GitHub tag to compare against
+# the way there is for the AWS CLI - ask it whether it considers itself stale.
+if [[ "$GCLOUD_OK" == "true" ]]; then
+  installed_gcloud=$(gcloud version --format="value('Google Cloud SDK')" 2>/dev/null | head -1)
+  [[ -z "$installed_gcloud" ]] && installed_gcloud=$(gcloud version 2>/dev/null | head -1 | grep -oE '[0-9]+[.][0-9]+[.][0-9]+')
+  if gcloud components list --format="value(state.name)" 2>/dev/null | grep -qi "update available"; then
+    echo ""
+    echo -e "  ${YLW}${WRN}  gcloud ${installed_gcloud} has component updates available.${RST}"
+    if _yn_prompt "Run 'gcloud components update' now?"; then
+      gcloud components update --quiet ||         echo -e "  ${YLW}${WRN}  Update failed (a package-manager install of gcloud updates via the package manager).${RST}"
+    fi
+  elif [[ -n "$installed_gcloud" ]]; then
+    echo -e "  ${GRN}${OK}  gcloud ${installed_gcloud} is up to date.${RST}"
+  fi
+fi
+
 # ── Summary ───────────────────────────────────────────────────
 echo ""
 echo -e "  ${WHT}Tool Check Summary:${RST}"
 echo ""
-for item in "AWS CLI:aws:$AWS_OK:required" "Terraform:terraform:$TERRAFORM_OK:optional" "Python3:python3:$PYTHON_OK:required"; do
+if [[ "$CLOUD" == "gcp" ]]; then
+  _summary_items=("gcloud CLI:gcloud:$GCLOUD_OK:required" "Terraform:terraform:$TERRAFORM_OK:optional" "Python3:python3:$PYTHON_OK:required")
+else
+  _summary_items=("AWS CLI:aws:$AWS_OK:required" "Terraform:terraform:$TERRAFORM_OK:optional" "Python3:python3:$PYTHON_OK:required")
+fi
+for item in "${_summary_items[@]}"; do
   IFS=':' read -r lbl nm ok req <<< "$item"
   if [[ "$ok" == "true" ]]; then
     printf "  %-20s " "$lbl"; echo -e "${GRN}${OK}  Ready${RST}"
@@ -510,7 +676,11 @@ done
 echo ""
 
 # ── Abort if required tools still missing ────────────────────
-if [[ "$AWS_OK" != "true" ]]; then
+if [[ "$CLOUD" == "gcp" ]]; then
+  if [[ "$GCLOUD_OK" != "true" ]]; then
+    echo -e "  ${RED}${ERR}  The Google Cloud CLI is required. Please install it and re-run.${RST}"; exit 1
+  fi
+elif [[ "$AWS_OK" != "true" ]]; then
   echo -e "  ${RED}${ERR}  AWS CLI is required. Please install it and re-run.${RST}"; exit 1
 fi
 if [[ "$PYTHON_OK" != "true" ]]; then
@@ -520,7 +690,7 @@ if [[ "$TERRAFORM_OK" != "true" ]]; then
   echo -e "  ${YLW}${WRN}  Terraform not available -- init/plan/apply steps will be skipped.${RST}"
   echo -e "  ${GRY}      Discovery, file generation and tagging will still run.${RST}"
   echo ""
-  confirm "  Continue without Terraform?" || { echo -e "${RED}  Aborted.${RST}"; exit 0; }
+  _yn_prompt "  Continue without Terraform?" || { echo -e "${RED}  Aborted.${RST}"; exit 0; }
 fi
 
 #endregion
@@ -614,8 +784,8 @@ $DRY_RUN    && MODE_LABEL="${YLW}DRY-RUN${RST}"
 $TEARDOWN   && MODE_LABEL="${RED}TEARDOWN${RST}"
 $DRIFT_ONLY && MODE_LABEL="${MAG}DRIFT DETECTION${RST}"
 
-header "Qlik Open Lakehouse  –  AWS Auto-Discovery  [${MODE_LABEL}]"
-$DRY_RUN  && echo -e "  ${YLW}${WRN}  DRY-RUN MODE: No AWS resources will be created or modified.${RST}"
+header "Qlik Open Lakehouse  –  ${CLOUD_LABEL} Auto-Discovery  [${MODE_LABEL}]"
+$DRY_RUN  && echo -e "  ${YLW}${WRN}  DRY-RUN MODE: No ${CLOUD_LABEL} resources will be created or modified.${RST}"
 $TEARDOWN && echo -e "  ${RED}${WRN}  TEARDOWN MODE: Resources will be permanently deleted.${RST}"
 echo ""
 #endregion
@@ -636,11 +806,23 @@ WORKLOAD="$REPLY"
 prompt_choice "Environment" "dev" "uat" "prod" -- "dev"; ENV="$REPLY"
 
 # Region selection with presets
-REGION_PRESETS=("us-east-1" "us-east-2" "us-west-1" "us-west-2" "eu-west-1" "eu-west-2" "eu-central-1" "ap-southeast-1" "ap-southeast-2" "ap-northeast-1")
+if [[ "$CLOUD" == "gcp" ]]; then
+  REGION_PRESETS=("us-central1" "us-east1" "us-east4" "us-west1" "europe-west1" "europe-west2" "europe-west3" "europe-west4" "asia-southeast1" "asia-northeast1")
+  REGION_DEFAULT="us-central1"
+  REGION_RE="^[a-z]+-[a-z]+[0-9]$"
+  REGION_HINT="Valid region e.g. us-central1."
+  REGION_WORD="Google Cloud"
+else
+  REGION_PRESETS=("us-east-1" "us-east-2" "us-west-1" "us-west-2" "eu-west-1" "eu-west-2" "eu-central-1" "ap-southeast-1" "ap-southeast-2" "ap-northeast-1")
+  REGION_DEFAULT="us-east-1"
+  REGION_RE="^[a-z]{2}-[a-z]+-[0-9]$"
+  REGION_HINT="Valid region e.g. us-east-1."
+  REGION_WORD="AWS"
+fi
 echo ""
-echo -e "    ${WHT}Select AWS region:${RST}"
+echo -e "    ${WHT}Select ${REGION_WORD} region:${RST}"
 for i in "${!REGION_PRESETS[@]}"; do
-  def_mark=""; [[ "${REGION_PRESETS[$i]}" == "us-east-1" ]] && def_mark=" ${GRY}(default)${RST}"
+  def_mark=""; [[ "${REGION_PRESETS[$i]}" == "$REGION_DEFAULT" ]] && def_mark=" ${GRY}(default)${RST}"
   printf "    [%2d] ${CYN}%s${RST}%b\n" "$(( i+1 ))" "${REGION_PRESETS[$i]}" "$def_mark"
 done
 echo -e "    [ C] ${GRY}Enter custom region${RST}"
@@ -649,19 +831,497 @@ while true; do
   read -rp "    Select (1-${#REGION_PRESETS[@]} or C) [default: 1]: " reg_sel
   reg_sel="${reg_sel:-1}"
   if [[ "${reg_sel^^}" == "C" ]]; then
-    prompt_val "Custom AWS region" "" \
-      "^[a-z]{2}-[a-z]+-[0-9]$" "Valid region e.g. us-east-1."
+    prompt_val "Custom ${REGION_WORD} region" "" "$REGION_RE" "$REGION_HINT"
     REGION="$REPLY"; break
   elif [[ "$reg_sel" =~ ^[0-9]+$ ]] && (( reg_sel>=1 && reg_sel<=${#REGION_PRESETS[@]} )); then
     REGION="${REGION_PRESETS[$((reg_sel-1))]}"; break
   fi
-  echo -e "    ${RED}${ERR}  Enter 1–${#REGION_PRESETS[@]} or C.${RST}"
+  echo -e "    ${RED}${ERR}  Enter 1-${#REGION_PRESETS[@]} or C.${RST}"
 done
 echo -e "  ${GRN}${OK}  Region: ${REGION}${RST}"
 
 PREFIX="${INITIALS}-${WORKLOAD}-${ENV}"
-TFSTATE_BUCKET="${INITIALS}-${WORKLOAD}-${ENV}-tfstate-s3"
 CREATE_DATE=$(date "+%Y-%m-%d")
+
+if [[ "$CLOUD" == "gcp" ]]; then
+  GCP_REGION="$REGION"
+  TFSTATE_BUCKET="${INITIALS}-${WORKLOAD}-${ENV}-tfstate-gcs"
+
+  # OLH spreads the cluster MIG over at least two zones, the same way it wants
+  # two AZs on AWS. Default to the region's first two zones.
+  echo ""
+  echo -e "    ${WHT}Zones for the lakehouse managed instance group${RST} ${GRY}(at least two)${RST}"
+  DEFAULT_ZONES="${GCP_REGION}-a,${GCP_REGION}-b"
+  while true; do
+    read -rp "    Zones, comma-separated [default: ${DEFAULT_ZONES}]: " _z
+    _z="${_z:-$DEFAULT_ZONES}"
+    IFS=',' read -r -a GCP_ZONES <<< "${_z// /}"
+    if (( ${#GCP_ZONES[@]} < 2 )); then
+      echo -e "    ${RED}${ERR}  OLH needs at least two zones so a Spot reclaim in one zone cannot take the cluster down.${RST}"
+      continue
+    fi
+    _bad=""
+    for z in "${GCP_ZONES[@]}"; do
+      [[ "$z" =~ ^${GCP_REGION}-[a-z]$ ]] || _bad+=" $z"
+    done
+    if [[ -n "$_bad" ]]; then
+      echo -e "    ${RED}${ERR}  Not zones of ${GCP_REGION}:${_bad}${RST}"
+      continue
+    fi
+    break
+  done
+  echo -e "  ${GRN}${OK}  Zones: ${GCP_ZONES[*]}${RST}"
+else
+  TFSTATE_BUCKET="${INITIALS}-${WORKLOAD}-${ENV}-tfstate-s3"
+fi
+
+if [[ "$CLOUD" == "gcp" ]]; then
+
+################################################################
+#  GOOGLE CLOUD PROVISIONING PATH
+#
+#  Mirrors the AWS groups below, service for service, with two deliberate
+#  differences:
+#    * No stream resource. The GCP Private Preview covers CDC and SaaS
+#      sources only; streaming, when it lands, is Kafka and GCS.
+#    * Private Google Access on the subnetwork stands in for the S3 gateway
+#      VPC endpoint.
+################################################################
+
+# ── Google Cloud Authentication ───────────────────────────────
+section "Google Cloud Authentication"
+
+echo -e "  ${WHT}Select Google Cloud authentication method:${RST}"
+echo ""
+echo -e "    [1] ${CYN}Current credentials${RST}   - use whatever 'gcloud auth' is already holding"
+echo -e "    [2] ${CYN}User login${RST}            - run 'gcloud auth login' (opens a browser)"
+echo -e "    [3] ${CYN}Service account key${RST}   - activate a JSON key file"
+echo ""
+while true; do
+  read -rp "    Select (1-3) [default: 1]: " gauth_sel
+  gauth_sel="${gauth_sel:-1}"
+  case "$gauth_sel" in
+    1) break ;;
+    2)
+      echo -e "  ${GRY}${ARW} gcloud auth login${RST}"
+      if ! $DRY_RUN; then
+        gcloud auth login || { echo -e "  ${RED}${ERR}  Login failed.${RST}"; exit 1; }
+      fi
+      break ;;
+    3)
+      prompt_val "Path to service account JSON key" "" "." "Enter a file path."
+      GCP_KEY_FILE="$REPLY"
+      if [[ ! -f "$GCP_KEY_FILE" ]]; then
+        echo -e "    ${RED}${ERR}  No such file: ${GCP_KEY_FILE}${RST}"; continue
+      fi
+      echo -e "  ${GRY}${ARW} gcloud auth activate-service-account --key-file=...${RST}"
+      if ! $DRY_RUN; then
+        gcloud auth activate-service-account --key-file="$GCP_KEY_FILE" \
+          || { echo -e "  ${RED}${ERR}  Could not activate that key.${RST}"; exit 1; }
+      fi
+      export GOOGLE_APPLICATION_CREDENTIALS="$GCP_KEY_FILE"
+      break ;;
+    *) echo -e "    ${RED}${ERR}  Enter 1-3.${RST}" ;;
+  esac
+done
+
+# ── Verify identity ───────────────────────────────────────────
+section "Verify Google Cloud Identity"
+echo -e "  ${GRY}${ARW} gcloud auth list --filter=status:ACTIVE${RST}"
+CALLER=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | head -1 || true)
+if [[ -z "$CALLER" ]]; then
+  echo -e "  ${RED}${ERR}  No active gcloud credentials. Run 'gcloud auth login' and re-run.${RST}"
+  exit 1
+fi
+echo -e "  ${GRN}${OK}  Authenticated as: ${CALLER}${RST}"
+
+# ── Project selection ─────────────────────────────────────────
+section "Google Cloud Project"
+echo -e "  ${GRY}${ARW} gcloud projects list${RST}"
+PROJ_JSON=$(gcloud projects list --format=json 2>/dev/null || echo "[]")
+PROJ_IDS=$(py "import sys,json; [print(p['projectId']) for p in json.load(sys.stdin)]" <<< "$PROJ_JSON")
+PROJ_LBLS=$(py "import sys,json; [print(f\"{p['projectId']}  ({p.get('name','')})  #{p.get('projectNumber','')}\") for p in json.load(sys.stdin)]" <<< "$PROJ_JSON")
+GCP_PROJECT_ID=""
+
+if [[ -n "$PROJ_IDS" ]]; then
+  pick_resource "Projects" "$PROJ_IDS" "$PROJ_LBLS"
+  [[ -n "$REPLY" ]] && GCP_PROJECT_ID="$REPLY"
+fi
+if [[ -z "$GCP_PROJECT_ID" ]]; then
+  prompt_val "Project ID" "" "^[a-z][a-z0-9-]{4,28}[a-z0-9]$" \
+    "6-30 chars, lowercase letters, digits and hyphens, starting with a letter."
+  GCP_PROJECT_ID="$REPLY"
+fi
+
+GCP_PROJECT_NUMBER=$(gcloud projects describe "$GCP_PROJECT_ID" \
+  --format="value(projectNumber)" 2>/dev/null || true)
+if [[ -z "$GCP_PROJECT_NUMBER" ]]; then
+  echo -e "  ${RED}${ERR}  Cannot read project ${GCP_PROJECT_ID}. Check the ID and your permissions.${RST}"
+  exit 1
+fi
+gcloud config set project "$GCP_PROJECT_ID" >/dev/null 2>&1 || true
+echo -e "  ${GRN}${OK}  Project: ${GCP_PROJECT_ID}  (number ${GCP_PROJECT_NUMBER})${RST}"
+
+# ── Application Default Credentials ───────────────────────────
+# The Terraform google provider reads ADC, not the gcloud CLI credential. They
+# are separate stores, and a wizard run that authenticated the CLI but not ADC
+# fails later at 'terraform plan' with a confusing error.
+section "Application Default Credentials"
+if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+  echo -e "  ${GRN}${OK}  GOOGLE_APPLICATION_CREDENTIALS is set - Terraform will use that key.${RST}"
+elif gcloud auth application-default print-access-token >/dev/null 2>&1; then
+  echo -e "  ${GRN}${OK}  ADC already configured.${RST}"
+else
+  echo -e "  ${YLW}${WRN}  No Application Default Credentials found.${RST}"
+  echo -e "  ${GRY}      Terraform's google provider needs these separately from the gcloud CLI login.${RST}"
+  if confirm "  Run 'gcloud auth application-default login' now?"; then
+    if ! $DRY_RUN; then
+      gcloud auth application-default login \
+        || echo -e "  ${YLW}${WRN}  ADC login failed - Terraform steps may not run.${RST}"
+    fi
+  else
+    echo -e "  ${YLW}${WRN}  Skipped. Terraform init/plan/apply will likely fail to authenticate.${RST}"
+  fi
+fi
+
+# ── Qlik Talend Cloud tenant binding ──────────────────────────
+section "Qlik Talend Cloud Tenant Binding"
+echo -e "  ${GRY}  These come from Administration > Network integrations in your QTC tenant.${RST}"
+echo ""
+prompt_val "QTC tenant ID" "" "^[A-Za-z0-9_.:-]{4,128}$" \
+  "4-128 chars: letters, digits, dot, colon, underscore or hyphen."
+QTC_TENANT_ID="$REPLY"
+
+echo ""
+echo -e "  ${WHT}How will Qlik Talend Cloud authenticate into this project?${RST}"
+echo -e "  ${YLW}  Note: Qlik has not published this for the Private Preview. Workload Identity${RST}"
+echo -e "  ${YLW}  Federation is the GCP counterpart of the assume-role + ExternalId pattern${RST}"
+echo -e "  ${YLW}  OLH uses on AWS, so it is the default here. Confirm against your preview${RST}"
+echo -e "  ${YLW}  onboarding pack before treating this as final.${RST}"
+echo ""
+echo -e "    [1] ${CYN}Workload Identity Federation${RST}  ${GRY}(default)${RST}"
+echo -e "    [2] ${CYN}Pre-authorized service account${RST}  ${GRY}- impersonation granted out of band${RST}"
+echo ""
+while true; do
+  read -rp "    Select (1-2) [default: 1]: " qauth_sel
+  qauth_sel="${qauth_sel:-1}"
+  case "$qauth_sel" in
+    1) QTC_AUTH_METHOD="workload_identity"
+       prompt_val "QTC OIDC issuer URI" "https://auth.qlik.com/oauth/token" \
+         "^https://.+" "Must be an https URL."
+       QTC_OIDC_ISSUER="$REPLY"
+       break ;;
+    2) QTC_AUTH_METHOD="preauthorized_sa"; QTC_OIDC_ISSUER=""; break ;;
+    *) echo -e "    ${RED}${ERR}  Enter 1 or 2.${RST}" ;;
+  esac
+done
+echo -e "  ${GRN}${OK}  Auth method: ${QTC_AUTH_METHOD}${RST}"
+
+# ── Required APIs ─────────────────────────────────────────────
+section "Required Google Cloud APIs"
+GCP_APIS=(
+  compute.googleapis.com
+  storage.googleapis.com
+  cloudkms.googleapis.com
+  secretmanager.googleapis.com
+  biglake.googleapis.com
+  bigquery.googleapis.com
+  iam.googleapis.com
+  iamcredentials.googleapis.com
+  sts.googleapis.com
+)
+echo -e "  ${GRY}${ARW} gcloud services enable ${GCP_APIS[*]}${RST}"
+if ! $DRY_RUN; then
+  if gcloud services enable "${GCP_APIS[@]}" --project="$GCP_PROJECT_ID" 2>/dev/null; then
+    echo -e "  ${GRN}${OK}  APIs enabled (${#GCP_APIS[@]} services).${RST}"
+  else
+    echo -e "  ${YLW}${WRN}  Could not enable every API - you may lack serviceusage.services.enable.${RST}"
+    echo -e "  ${GRY}      Ask a project owner to enable: ${GCP_APIS[*]}${RST}"
+    confirm "  Continue anyway?" || { echo -e "${RED}  Aborted.${RST}"; exit 0; }
+  fi
+else
+  echo -e "  ${YLW}[DRY-RUN] Would enable ${#GCP_APIS[@]} APIs.${RST}"
+fi
+
+################################################################
+#  GROUP 2 - Network (VPC -> subnetwork -> NAT -> firewall)
+################################################################
+header "Group 2 of 5  -  Network"
+
+# ── VPC network ──────────────────────────────────────────────
+section "VPC Network"
+echo -e "  ${GRY}${ARW} gcloud compute networks list${RST}"
+NET_JSON=$(gcloud compute networks list --project="$GCP_PROJECT_ID" --format=json 2>/dev/null || echo "[]")
+NET_IDS=$(py "import sys,json; [print(n['name']) for n in json.load(sys.stdin)]" <<< "$NET_JSON")
+NET_LBLS=$(py "import sys,json; [print(f\"{n['name']}  ({n.get('subnetMode','')})\") for n in json.load(sys.stdin)]" <<< "$NET_JSON")
+NETWORK_NAME=""
+
+if [[ -n "$NET_IDS" ]]; then
+  pick_resource "VPC Networks" "$NET_IDS" "$NET_LBLS"
+  [[ -n "$REPLY" ]] && NETWORK_NAME="$REPLY" && echo -e "  ${GRN}${OK}  Using network: ${NETWORK_NAME}${RST}"
+fi
+if [[ -z "$NETWORK_NAME" ]]; then
+  prompt_val "New network name" "${PREFIX}-vpc" "^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$" \
+    "Lowercase, starts with a letter, up to 63 chars."
+  NETWORK_NAME="$REPLY"
+  dry_exec "gcloud compute networks create ${NETWORK_NAME} --project=${GCP_PROJECT_ID} --subnet-mode=custom"
+  echo -e "  ${GRN}${OK}  Created network: ${NETWORK_NAME}${RST}"
+fi
+
+# ── Subnetwork ───────────────────────────────────────────────
+section "Subnetwork"
+echo -e "  ${GRY}${ARW} gcloud compute networks subnets list --regions=${GCP_REGION}${RST}"
+SUB_JSON=$(gcloud compute networks subnets list --project="$GCP_PROJECT_ID" \
+  --regions="$GCP_REGION" --filter="network~${NETWORK_NAME}$" --format=json 2>/dev/null || echo "[]")
+SUB_IDS=$(py "import sys,json; [print(s['name']) for s in json.load(sys.stdin)]" <<< "$SUB_JSON")
+SUB_LBLS=$(py "import sys,json; [print(f\"{s['name']}  {s['ipCidrRange']}  PGA:{'on' if s.get('privateIpGoogleAccess') else 'OFF'}\") for s in json.load(sys.stdin)]" <<< "$SUB_JSON")
+SUBNETWORK_NAME=""
+
+if [[ -n "$SUB_IDS" ]]; then
+  pick_resource "Subnetworks" "$SUB_IDS" "$SUB_LBLS"
+  [[ -n "$REPLY" ]] && SUBNETWORK_NAME="$REPLY" && echo -e "  ${GRN}${OK}  Using subnetwork: ${SUBNETWORK_NAME}${RST}"
+fi
+if [[ -z "$SUBNETWORK_NAME" ]]; then
+  prompt_val "New subnetwork name" "${PREFIX}-subnet" "^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$" \
+    "Lowercase, starts with a letter, up to 63 chars."
+  SUBNETWORK_NAME="$REPLY"
+  prompt_val "Subnetwork CIDR" "10.20.0.0/20" \
+    "^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$" "Valid CIDR."
+  SUBNETWORK_CIDR="$REPLY"
+  dry_exec "gcloud compute networks subnets create ${SUBNETWORK_NAME} --project=${GCP_PROJECT_ID} --network=${NETWORK_NAME} --region=${GCP_REGION} --range=${SUBNETWORK_CIDR} --enable-private-ip-google-access"
+  echo -e "  ${GRN}${OK}  Created subnetwork: ${SUBNETWORK_NAME}  (${SUBNETWORK_CIDR}, Private Google Access on)${RST}"
+fi
+
+# Read back the live CIDR and Private Google Access state, whichever path we
+# took. Private Google Access is an OLH prerequisite - the GCP counterpart of
+# the S3 gateway endpoint - so fix it here rather than failing at plan time.
+if ! $DRY_RUN; then
+  SUB_DESC=$(gcloud compute networks subnets describe "$SUBNETWORK_NAME" \
+    --project="$GCP_PROJECT_ID" --region="$GCP_REGION" --format=json 2>/dev/null || echo "{}")
+  SUBNETWORK_CIDR=$(py "import sys,json; print(json.load(sys.stdin).get('ipCidrRange',''))" <<< "$SUB_DESC")
+  PGA=$(py "import sys,json; print('true' if json.load(sys.stdin).get('privateIpGoogleAccess') else 'false')" <<< "$SUB_DESC")
+  if [[ "$PGA" != "true" ]]; then
+    echo -e "  ${YLW}${WRN}  Private Google Access is off on ${SUBNETWORK_NAME}.${RST}"
+    echo -e "  ${GRY}      OLH nodes reach Cloud Storage and the catalog over Google APIs; without${RST}"
+    echo -e "  ${GRY}      it that traffic has to leave through the internet gateway.${RST}"
+    if confirm "  Enable Private Google Access now?"; then
+      gcloud compute networks subnets update "$SUBNETWORK_NAME" \
+        --project="$GCP_PROJECT_ID" --region="$GCP_REGION" \
+        --enable-private-ip-google-access >/dev/null 2>&1 \
+        && echo -e "  ${GRN}${OK}  Private Google Access enabled.${RST}" \
+        || echo -e "  ${RED}${ERR}  Could not enable it - Terraform will refuse to plan.${RST}"
+    fi
+  else
+    echo -e "  ${GRN}${OK}  Private Google Access: on${RST}"
+  fi
+  echo -e "  ${GRN}${OK}  Subnetwork CIDR: ${SUBNETWORK_CIDR}${RST}"
+else
+  SUBNETWORK_CIDR="${SUBNETWORK_CIDR:-10.20.0.0/20}"
+fi
+
+# ── Cloud NAT ────────────────────────────────────────────────
+# Lakehouse nodes run without external IPs. Private Google Access covers Google
+# APIs; Cloud NAT is what lets the agent reach Qlik Talend Cloud itself, which
+# is the GCP equivalent of the Internet Gateway on the AWS side.
+section "Cloud Router and NAT"
+NAT_ROUTER="${PREFIX}-router"
+NAT_NAME="${PREFIX}-nat"
+if gcloud compute routers describe "$NAT_ROUTER" --project="$GCP_PROJECT_ID" \
+     --region="$GCP_REGION" >/dev/null 2>&1; then
+  echo -e "  ${GRN}${OK}  Cloud Router exists: ${NAT_ROUTER}${RST}"
+else
+  echo -e "  ${YLW}${WRN}  Cloud Router not found - creating.${RST}"
+  dry_exec "gcloud compute routers create ${NAT_ROUTER} --project=${GCP_PROJECT_ID} --network=${NETWORK_NAME} --region=${GCP_REGION}"
+  echo -e "  ${GRN}${OK}  Created: ${NAT_ROUTER}${RST}"
+fi
+if gcloud compute routers nats describe "$NAT_NAME" --router="$NAT_ROUTER" \
+     --project="$GCP_PROJECT_ID" --region="$GCP_REGION" >/dev/null 2>&1; then
+  echo -e "  ${GRN}${OK}  Cloud NAT exists: ${NAT_NAME}${RST}"
+else
+  echo -e "  ${YLW}${WRN}  Cloud NAT not found - creating.${RST}"
+  dry_exec "gcloud compute routers nats create ${NAT_NAME} --router=${NAT_ROUTER} --project=${GCP_PROJECT_ID} --region=${GCP_REGION} --auto-allocate-nat-external-ip --nat-all-subnet-ip-ranges"
+  echo -e "  ${GRN}${OK}  Created: ${NAT_NAME}${RST}"
+fi
+
+# ── Firewall ─────────────────────────────────────────────────
+# The GCP counterpart of the OLH security group: all TCP from inside the
+# subnet so cluster nodes can talk to each other. Egress is allowed by GCP's
+# implied default-allow-egress rule, so no egress rule is needed here.
+section "Firewall Rule"
+FIREWALL_RULE="${PREFIX}-allow-internal"
+if gcloud compute firewall-rules describe "$FIREWALL_RULE" \
+     --project="$GCP_PROJECT_ID" >/dev/null 2>&1; then
+  echo -e "  ${GRN}${OK}  Firewall rule exists: ${FIREWALL_RULE}${RST}"
+else
+  echo -e "  ${YLW}${WRN}  Firewall rule not found - creating.${RST}"
+  dry_exec "gcloud compute firewall-rules create ${FIREWALL_RULE} --project=${GCP_PROJECT_ID} --network=${NETWORK_NAME} --direction=INGRESS --action=ALLOW --rules=tcp:0-65535 --source-ranges=${SUBNETWORK_CIDR} --description='Qlik Open Lakehouse intra-cluster traffic'"
+  echo -e "  ${GRN}${OK}  Created: ${FIREWALL_RULE}  (ingress from ${SUBNETWORK_CIDR})${RST}"
+fi
+
+################################################################
+#  GROUP 3 - Security & Encryption (KMS -> service accounts)
+################################################################
+header "Group 3 of 5  -  Security & Encryption"
+
+# ── Cloud KMS ────────────────────────────────────────────────
+section "Cloud KMS Symmetric Key"
+KMS_KEYRING="${PREFIX}-kr"
+KMS_KEYNAME="${PREFIX}-key"
+if gcloud kms keyrings describe "$KMS_KEYRING" --project="$GCP_PROJECT_ID" \
+     --location="$GCP_REGION" >/dev/null 2>&1; then
+  echo -e "  ${GRN}${OK}  Key ring exists: ${KMS_KEYRING}${RST}"
+else
+  echo -e "  ${YLW}${WRN}  Key ring not found - creating.${RST}"
+  dry_exec "gcloud kms keyrings create ${KMS_KEYRING} --project=${GCP_PROJECT_ID} --location=${GCP_REGION}"
+  echo -e "  ${GRN}${OK}  Created key ring: ${KMS_KEYRING}${RST}"
+fi
+if gcloud kms keys describe "$KMS_KEYNAME" --project="$GCP_PROJECT_ID" \
+     --location="$GCP_REGION" --keyring="$KMS_KEYRING" >/dev/null 2>&1; then
+  echo -e "  ${GRN}${OK}  Key exists: ${KMS_KEYNAME}${RST}"
+else
+  echo -e "  ${YLW}${WRN}  Key not found - creating.${RST}"
+  dry_exec "gcloud kms keys create ${KMS_KEYNAME} --project=${GCP_PROJECT_ID} --location=${GCP_REGION} --keyring=${KMS_KEYRING} --purpose=encryption"
+  echo -e "  ${GRN}${OK}  Created key: ${KMS_KEYNAME}${RST}"
+fi
+KMS_KEY_ID="projects/${GCP_PROJECT_ID}/locations/${GCP_REGION}/keyRings/${KMS_KEYRING}/cryptoKeys/${KMS_KEYNAME}"
+echo -e "  ${GRN}${OK}  Key ID: ${KMS_KEY_ID}${RST}"
+
+# Cloud Storage cannot write CMEK-encrypted objects until its own service agent
+# can use the key. Without this, bucket creation with --default-encryption-key
+# fails with a permission error that does not name the cause.
+section "Cloud Storage Service Agent Grant"
+GCS_AGENT=$(gcloud storage service-agent --project="$GCP_PROJECT_ID" 2>/dev/null || true)
+if [[ -n "$GCS_AGENT" ]]; then
+  echo -e "  ${GRY}${ARW} Granting cryptoKeyEncrypterDecrypter to ${GCS_AGENT}${RST}"
+  if ! $DRY_RUN; then
+    gcloud kms keys add-iam-policy-binding "$KMS_KEYNAME" \
+      --project="$GCP_PROJECT_ID" --location="$GCP_REGION" --keyring="$KMS_KEYRING" \
+      --member="serviceAccount:${GCS_AGENT}" \
+      --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" >/dev/null 2>&1 \
+      && echo -e "  ${GRN}${OK}  Storage service agent can use the key.${RST}" \
+      || echo -e "  ${YLW}${WRN}  Grant failed - CMEK bucket creation may fail.${RST}"
+  else
+    echo -e "  ${YLW}[DRY-RUN] Would grant the storage service agent use of the key.${RST}"
+  fi
+else
+  echo -e "  ${YLW}${WRN}  Could not resolve the Cloud Storage service agent.${RST}"
+fi
+
+# ── Service accounts ─────────────────────────────────────────
+# Two accounts, on purpose. QTC impersonates the management account from
+# outside the project; the node account is attached to the agent VM and the
+# cluster MIG and holds the data-plane grants. Collapsing them into one is the
+# mistake the AWS path used to make with mgmt_role_arn.
+section "Service Accounts"
+
+make_service_account() {
+  local sa_id="$1" display="$2" email
+  email="${sa_id}@${GCP_PROJECT_ID}.iam.gserviceaccount.com"
+  if gcloud iam service-accounts describe "$email" \
+       --project="$GCP_PROJECT_ID" >/dev/null 2>&1; then
+    echo -e "  ${GRN}${OK}  ${display} exists: ${email}${RST}" >&2
+  else
+    echo -e "  ${YLW}${WRN}  ${display} not found - creating ${sa_id}${RST}" >&2
+    if ! $DRY_RUN; then
+      gcloud iam service-accounts create "$sa_id" --project="$GCP_PROJECT_ID" \
+        --display-name="$display" >/dev/null 2>&1 \
+        || { echo -e "  ${RED}${ERR}  Could not create ${sa_id}.${RST}" >&2; }
+      echo -e "  ${GRN}${OK}  Created: ${email}${RST}" >&2
+    else
+      echo -e "  ${YLW}[DRY-RUN] Would create service account ${sa_id}${RST}" >&2
+    fi
+  fi
+  echo "$email"
+}
+
+# Service account IDs are capped at 30 characters, so fall back to a short form
+# when the prefix is long rather than letting gcloud reject the name.
+MGMT_SA_ID="${PREFIX}-mgmt"
+NODE_SA_ID="${PREFIX}-node"
+if (( ${#MGMT_SA_ID} > 30 )); then
+  MGMT_SA_ID="${INITIALS}-${ENV}-olh-mgmt"
+  NODE_SA_ID="${INITIALS}-${ENV}-olh-node"
+  echo -e "  ${GRY}  Prefix too long for a 30-char service account ID; using ${MGMT_SA_ID} / ${NODE_SA_ID}.${RST}"
+fi
+
+MGMT_SA=$(make_service_account "$MGMT_SA_ID" "Qlik OLH management (${PREFIX})")
+NODE_SA=$(make_service_account "$NODE_SA_ID" "Qlik OLH nodes (${PREFIX})")
+
+# Project roles the management account needs to stand up and run the cluster
+# on your behalf. Terraform adds the narrower, resource-scoped grants.
+section "Management Service Account Roles"
+MGMT_ROLES=(
+  roles/compute.instanceAdmin.v1
+  roles/compute.networkUser
+  roles/iam.serviceAccountUser
+)
+echo -e "  ${WHT}Granting to ${MGMT_SA}:${RST}"
+for role in "${MGMT_ROLES[@]}"; do
+  echo -e "  ${GRY}    ${ARW} ${role}${RST}"
+  if ! $DRY_RUN; then
+    gcloud projects add-iam-policy-binding "$GCP_PROJECT_ID" \
+      --member="serviceAccount:${MGMT_SA}" --role="$role" \
+      --condition=None >/dev/null 2>&1 \
+      || echo -e "  ${YLW}${WRN}    Could not grant ${role}.${RST}"
+  fi
+done
+$DRY_RUN && echo -e "  ${YLW}[DRY-RUN] Would grant ${#MGMT_ROLES[@]} roles.${RST}" \
+         || echo -e "  ${GRN}${OK}  ${#MGMT_ROLES[@]} roles granted.${RST}"
+
+################################################################
+#  GROUP 4 - Storage (GCS buckets)
+#
+#  No streaming resource here: the GCP Private Preview covers CDC and SaaS
+#  sources only. On AWS this group also creates a Kinesis stream.
+################################################################
+header "Group 4 of 5  -  Storage"
+
+create_or_use_gcs_bucket() {
+  local bname="$1" label="$2" cmek="$3" bn
+  echo -e "  ${GRY}${ARW} gcloud storage buckets describe gs://${bname}${RST}" >&2
+  if gcloud storage buckets describe "gs://${bname}" --project="$GCP_PROJECT_ID" >/dev/null 2>&1; then
+    echo -e "  ${GRN}${OK}  ${label} exists: ${bname}${RST}" >&2
+    if confirm "    Use existing '${bname}'?"; then echo "$bname"; return; fi
+  else
+    echo -e "  ${YLW}${WRN}  ${label} not found.${RST}" >&2
+  fi
+  prompt_val "    Bucket name for ${label}" "$bname" \
+    "^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$" "Valid GCS bucket name."
+  bn="$REPLY"
+  if ! $DRY_RUN; then
+    local enc=""
+    [[ "$cmek" == "cmek" ]] && enc="--default-encryption-key=${KMS_KEY_ID}"
+    local cb_out=""
+    cb_out=$(gcloud storage buckets create "gs://${bn}" --project="$GCP_PROJECT_ID" \
+      --location="$GCP_REGION" --uniform-bucket-level-access \
+      --public-access-prevention $enc 2>&1) || {
+      echo -e "  ${RED}${ERR}  Could not create ${bn}:${RST}" >&2
+      echo -e "  ${GRY}      ${cb_out}${RST}" >&2
+      exit 1; }
+    gcloud storage buckets update "gs://${bn}" --project="$GCP_PROJECT_ID" \
+      --update-labels="owner=${INITIALS},environment=${ENV},workload=qlik-olh,application=open-lakehouse,createdate=${CREATE_DATE},managedby=script" \
+      >/dev/null 2>&1 || true
+    echo -e "  ${GRN}${OK}  Created: ${bn}  (${cmek}, uniform access, public access prevented)${RST}" >&2
+  else
+    echo -e "  ${YLW}[DRY-RUN] Would create bucket: ${bn}${RST}" >&2
+  fi
+  echo "$bn"
+}
+
+section "Cloud Storage Buckets"
+GCS_TABLE=$(create_or_use_gcs_bucket   "${PREFIX}-table-gcs"   "Iceberg table storage" "cmek")
+GCS_LANDING=$(create_or_use_gcs_bucket "${PREFIX}-landing-gcs" "Landing bucket"        "cmek")
+GCS_CONFIG=$(create_or_use_gcs_bucket  "${PREFIX}-config-gcs"  "Config bucket"         "cmek")
+create_or_use_gcs_bucket "$TFSTATE_BUCKET" "TF State bucket" "google-managed" > /dev/null
+
+# Terraform state benefits from versioning even though the lakehouse buckets
+# do not need it.
+if ! $DRY_RUN; then
+  gcloud storage buckets update "gs://${TFSTATE_BUCKET}" --project="$GCP_PROJECT_ID" \
+    --versioning >/dev/null 2>&1 || true
+fi
+
+else
 
 # ── AWS Credentials Configuration ─────────────────────────────
 section "AWS Authentication"
@@ -951,6 +1611,20 @@ fi
 echo -e "\n  ${GRN}Base prefix : ${PREFIX}${RST}"
 echo -e "  ${GRN}Create date : ${CREATE_DATE}${RST}"
 
+# QTC tenant binding. Collected before any IAM work, because the management
+# role's trust policy is built from these two values. Without them QTC has
+# nothing it can assume and the network integration never connects.
+section "Qlik Talend Cloud Tenant Binding"
+echo -e "  ${GRY}  Both values come from Administration > Network integrations in QTC,${RST}"
+echo -e "  ${GRY}  on the screen where you create the integration.${RST}"
+echo ""
+prompt_val "QTC ExternalId" "" "^[A-Za-z0-9_.:/=+-]{4,1224}$" "4-1224 chars: letters, digits and _.:/=+- (the sts:ExternalId format)."
+QTC_EXTERNAL_ID="$REPLY"
+
+prompt_val "Qlik proxy role ARN" "" "^arn:aws[a-z-]*:iam::[0-9]{12}:(role|user)/.+$" "An IAM role or user ARN, e.g. arn:aws:iam::<qlik-account>:role/qlik-proxy-assume-role."
+QLIK_PROXY_ROLE_ARN="$REPLY"
+echo -e "  ${GRN}${OK}  Management role will trust ${QLIK_PROXY_ROLE_ARN} with your ExternalId.${RST}"
+
 ################################################################
 #  PRE-FLIGHT — Permission & Duplicate Guard
 ################################################################
@@ -968,11 +1642,50 @@ declare -A PERMS=(
   ["STS"]="sts:GetCallerIdentity"
 )
 PREFLIGHT_OK=true
-for svc in EC2 S3 IAM KMS Kinesis Glue STS; do
-  echo -e "  ${GRY}${ARW} Simulating ${svc} permissions via iam:SimulatePrincipalPolicy${RST}"
-  # In production this calls: aws iam simulate-principal-policy --policy-source-arn <arn> --action-names <actions>
-  echo -e "  ${GRN}${OK}  ${svc}: all required permissions granted${RST}"
-done
+# simulate-principal-policy needs an IAM role or user ARN as the policy source.
+# A session ARN (arn:aws:sts::<acct>:assumed-role/<Role>/<session>) is not one,
+# so reduce it to the underlying role before asking.
+POLICY_SRC=""
+case "$CALLER" in
+  arn:*:iam::*:role/*|arn:*:iam::*:user/*) POLICY_SRC="$CALLER" ;;
+  arn:*:sts::*:assumed-role/*)
+    _sim_part="$(cut -d: -f2 <<< "$CALLER")"
+    _sim_role="${CALLER#*:assumed-role/}"; _sim_role="${_sim_role%%/*}"
+    POLICY_SRC="arn:${_sim_part}:iam::${ACCT_ID}:role/${_sim_role}" ;;
+esac
+
+if [[ -z "$POLICY_SRC" ]]; then
+  echo -e "  ${YLW}${WRN}  Could not verify permissions: '${CALLER}' is not an IAM role or user ARN.${RST}"
+  echo -e "  ${GRY}      Nothing was measured -- creation steps may still fail on access denied.${RST}"
+else
+  echo -e "  ${GRY}      Policy source: ${POLICY_SRC}${RST}"
+  for svc in EC2 S3 IAM KMS Kinesis Glue STS; do
+    echo -e "  ${GRY}${ARW} Simulating ${svc} permissions via iam:SimulatePrincipalPolicy${RST}"
+    read -ra _sim_actions <<< "${PERMS[$svc]}"
+    if _sim_denied=$(aws iam simulate-principal-policy \
+          --policy-source-arn "$POLICY_SRC" \
+          --action-names "${_sim_actions[@]}" \
+          --query "EvaluationResults[?EvalDecision!='allowed'].EvalActionName" \
+          --output text 2>/dev/null); then
+      _sim_denied=$(tr '\t' ' ' <<< "$_sim_denied")
+      if [[ -z "${_sim_denied// /}" || "$_sim_denied" == "None" ]]; then
+        echo -e "  ${GRN}${OK}  ${svc}: all required permissions granted${RST}"
+      else
+        echo -e "  ${RED}${ERR}  ${svc}: denied - ${_sim_denied}${RST}"
+        PREFLIGHT_OK=false
+      fi
+    else
+      echo -e "  ${YLW}${WRN}  ${svc}: could not verify (iam:SimulatePrincipalPolicy denied or unavailable)${RST}"
+    fi
+  done
+fi
+
+if ! $PREFLIGHT_OK; then
+  echo ""
+  echo -e "  ${RED}${ERR}  Required actions are denied for ${POLICY_SRC}.${RST}"
+  echo -e "  ${GRY}      The create steps below will fail on those services.${RST}"
+  confirm "  Continue anyway?" || { echo -e "${RED}  Aborted.${RST}"; exit 0; }
+fi
 
 # CloudTrail check (non-blocking)
 echo -e "  ${GRY}${ARW} Checking CloudTrail audit logging status${RST}"
@@ -1034,7 +1747,6 @@ fi
 # ── Drift-only mode shortcut ─────────────────────────────────
 if $DRIFT_ONLY; then
   header "Drift Detection — ${PREFIX}"
-  TFVARS="terraform.tfvars"
   if [[ ! -f "$TFVARS" ]]; then
     echo -e "  ${RED}${ERR}  terraform.tfvars not found. Run a deployment first.${RST}"; exit 1; fi
 
@@ -1088,21 +1800,26 @@ if $TEARDOWN; then
 
   # Read the ACTUAL resource names from terraform.tfvars when present.
   # The user may have customized names during deployment -- recomputing
-  # defaults from PREFIX would orphan renamed resources.
+  # defaults from PREFIX would orphan renamed resources. X="${v:-$X}" rather
+  # than [[ -n ]] && X=...: an absent key must not trip set -e.
   TD_ICEBERG="${PREFIX}-iceberg-s3"
+  TD_LANDING="${PREFIX}-landing-s3"
+  TD_CONFIG="${PREFIX}-config-s3"
   TD_KINESIS="${PREFIX}-stream-kinesis"
-  if [[ -f "terraform.tfvars" ]]; then
-    v=$(grep -E '^s3_bucket_name'      terraform.tfvars | cut -d'"' -f2 || true); [[ -n "$v" ]] && TD_ICEBERG="$v"
-    v=$(grep -E '^kinesis_stream_name' terraform.tfvars | cut -d'"' -f2 || true); [[ -n "$v" ]] && TD_KINESIS="$v"
+  if [[ -f "$TFVARS" ]]; then
+    v=$(grep -E '^s3_bucket_name[[:space:]]*='      "$TFVARS" | head -1 | cut -d'"' -f2 || true); TD_ICEBERG="${v:-$TD_ICEBERG}"
+    v=$(grep -E '^s3_landing_bucket[[:space:]]*='   "$TFVARS" | head -1 | cut -d'"' -f2 || true); TD_LANDING="${v:-$TD_LANDING}"
+    v=$(grep -E '^s3_config_bucket[[:space:]]*='    "$TFVARS" | head -1 | cut -d'"' -f2 || true); TD_CONFIG="${v:-$TD_CONFIG}"
+    v=$(grep -E '^kinesis_stream_name[[:space:]]*=' "$TFVARS" | head -1 | cut -d'"' -f2 || true); TD_KINESIS="${v:-$TD_KINESIS}"
   else
-    echo -e "  ${YLW}${WRN}  terraform.tfvars not found -- using default names derived from prefix.${RST}"
+    echo -e "  ${YLW}${WRN}  ${TFVARS} not found -- using default names derived from prefix.${RST}"
   fi
 
-  echo -e "\n  ${GRY}${ARW} terraform destroy -auto-approve -var-file=terraform.tfvars${RST}"
-  dry_exec "terraform destroy -auto-approve -var-file=terraform.tfvars"
+  echo -e "\n  ${GRY}${ARW} terraform -chdir=${TF_PATH} destroy -auto-approve -var-file=terraform.tfvars${RST}"
+  dry_exec "terraform -chdir=\"${TF_PATH}\" destroy -auto-approve -var-file=terraform.tfvars"
 
   section "Removing resources not managed by Terraform"
-  for bucket in "${TD_ICEBERG}" "${PREFIX}-landing-s3" "${PREFIX}-config-s3"; do
+  for bucket in "${TD_ICEBERG}" "${TD_LANDING}" "${TD_CONFIG}"; do
     echo -e "  ${GRY}${ARW} Emptying and removing S3 bucket: ${bucket}${RST}"
     dry_exec "aws s3 rm s3://${bucket} --recursive --region ${REGION} 2>/dev/null || true"
     dry_exec "aws s3api delete-bucket --bucket ${bucket} --region ${REGION} 2>/dev/null || true"
@@ -1235,6 +1952,66 @@ else
   done
 fi
 
+# ── Subnet prerequisite check ────────────────────────────────
+# OLH wants at least two subnets, in two different Availability Zones, each of
+# them public: auto-assign public IP on, with a route to an Internet Gateway.
+# The picker above accepts anything, so verify it here rather than discovering
+# the problem when a cluster fails to launch.
+section "Subnet Prerequisite Check"
+declare -A _AZ_SEEN=()
+SUBNET_IDS_CSV=""
+NONPUBLIC=""
+for pair in "${SUBNET_AZ_PAIRS[@]}"; do
+  sub_id="${pair%%|*}"; sub_az="${pair##*|}"
+  _AZ_SEEN["$sub_az"]=1
+  SUBNET_IDS_CSV+="${SUBNET_IDS_CSV:+,}${sub_id}"
+  if ! $DRY_RUN; then
+    map_pub=$(aws ec2 describe-subnets --subnet-ids "$sub_id" --region "$REGION" --query "Subnets[0].MapPublicIpOnLaunch" --output text 2>/dev/null || echo "False")
+    [[ "$map_pub" != "True" ]] && NONPUBLIC+=" ${sub_id}"
+  fi
+done
+
+AZ_COUNT=${#_AZ_SEEN[@]}
+if (( ${#SUBNET_AZ_PAIRS[@]} < 2 )); then
+  echo -e "  ${RED}${ERR}  Only ${#SUBNET_AZ_PAIRS[@]} subnet selected. OLH requires at least two.${RST}"
+  confirm "  Continue anyway (Terraform will refuse to plan)?" || { echo -e "${RED}  Aborted.${RST}"; exit 0; }
+elif (( AZ_COUNT < 2 )); then
+  echo -e "  ${RED}${ERR}  The selected subnets span only ${AZ_COUNT} Availability Zone.${RST}"
+  echo -e "  ${GRY}      OLH spreads the cluster over two AZs; a single-AZ selection cannot survive an AZ event.${RST}"
+  confirm "  Continue anyway (Terraform will refuse to plan)?" || { echo -e "${RED}  Aborted.${RST}"; exit 0; }
+else
+  echo -e "  ${GRN}${OK}  ${#SUBNET_AZ_PAIRS[@]} subnets across ${AZ_COUNT} Availability Zones.${RST}"
+fi
+
+if [[ -n "$NONPUBLIC" ]]; then
+  echo -e "  ${YLW}${WRN}  These subnets do not auto-assign public IPs:${NONPUBLIC}${RST}"
+  echo -e "  ${GRY}      OLH cluster subnets must be public. Terraform will refuse to plan otherwise.${RST}"
+  if confirm "  Enable auto-assign public IP on them now?"; then
+    for sn in $NONPUBLIC; do
+      aws ec2 modify-subnet-attribute --subnet-id "$sn" --region "$REGION" --map-public-ip-on-launch &>/dev/null && echo -e "  ${GRN}${OK}  ${sn} updated.${RST}" || echo -e "  ${RED}${ERR}  Could not update ${sn}.${RST}"
+    done
+  fi
+else
+  $DRY_RUN || echo -e "  ${GRN}${OK}  All selected subnets auto-assign public IPs.${RST}"
+fi
+
+# ── S3 gateway VPC endpoint ──────────────────────────────────
+# An OLH network prerequisite. AWS allows one gateway endpoint per VPC per
+# service, so find an existing one and hand it to Terraform; otherwise leave
+# the tfvars entry empty and let Terraform create it.
+section "S3 Gateway VPC Endpoint"
+S3_VPCE_ID=""
+if ! $DRY_RUN; then
+  echo -e "  ${GRY}${ARW} aws ec2 describe-vpc-endpoints --filters vpc-id=${VPC_ID} service=s3${RST}"
+  S3_VPCE_ID=$(aws ec2 describe-vpc-endpoints --region "$REGION" --filters "Name=vpc-id,Values=${VPC_ID}" "Name=service-name,Values=com.amazonaws.${REGION}.s3" --query "VpcEndpoints[?VpcEndpointType=='Gateway']|[0].VpcEndpointId" --output text 2>/dev/null || echo "")
+  [[ "$S3_VPCE_ID" == "None" ]] && S3_VPCE_ID=""
+fi
+if [[ -n "$S3_VPCE_ID" ]]; then
+  echo -e "  ${GRN}${OK}  Existing gateway endpoint: ${S3_VPCE_ID}  (Terraform will reuse it)${RST}"
+else
+  echo -e "  ${YLW}${WRN}  No S3 gateway endpoint in this VPC - Terraform will create one.${RST}"
+fi
+
 # ── Security Group ────────────────────────────────────────────
 section "Security Group"
 echo -e "  ${GRY}${ARW} aws ec2 describe-security-groups --filter vpc-id=${VPC_ID} name=*${PREFIX}*${RST}"
@@ -1251,7 +2028,7 @@ if [[ -n "$SG_IDS" ]]; then
   [[ -n "$REPLY" ]] && SG_ID="$REPLY" && echo -e "  ${GRN}${OK}  Using SG: ${SG_ID}${RST}"
 fi
 if [[ -z "$SG_ID" ]]; then
-  echo -e "  ${YLW}  Creating ${PREFIX}-sg (egress 443 only)${RST}"
+  echo -e "  ${YLW}  Creating ${PREFIX}-sg (OLH rules: inbound all TCP from the VPC CIDR)${RST}"
   if ! $DRY_RUN; then
     SG_ID=$(aws ec2 create-security-group \
       --group-name "${PREFIX}-sg" \
@@ -1259,9 +2036,14 @@ if [[ -z "$SG_ID" ]]; then
       --vpc-id "$VPC_ID" --region "$REGION" \
       --tag-specifications "$(tag_spec security-group "${PREFIX}-sg" "$INITIALS" "$ENV" "$CREATE_DATE")" \
       --output json | py "import sys,json; print(json.load(sys.stdin)['GroupId'])")
-    aws ec2 authorize-security-group-egress --group-id "$SG_ID" --region "$REGION" \
-      --ip-permissions "IpProtocol=tcp,FromPort=443,ToPort=443,IpRanges=[{CidrIp=0.0.0.0/0}]" &>/dev/null || true
-    echo -e "  ${GRN}${OK}  Created SG: ${SG_ID}${RST}"
+    # OLH requires inbound All TCP from the VPC CIDR so cluster nodes and the
+    # network integration agent can reach each other. This rule was missing,
+    # which left the cluster unable to form.
+    aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --region "$REGION" \
+      --ip-permissions "IpProtocol=tcp,FromPort=0,ToPort=65535,IpRanges=[{CidrIp=${VPC_CIDR}}]" &>/dev/null || true
+    # Outbound is already unrestricted: AWS attaches an allow-all egress rule
+    # to every new security group, which is what OLH asks for.
+    echo -e "  ${GRN}${OK}  Created SG: ${SG_ID}  (ingress all TCP from ${VPC_CIDR}, egress all)${RST}"
   else
     SG_ID="sg-DRYRUN"
     echo -e "  ${YLW}[DRY-RUN] Would create security group ${PREFIX}-sg${RST}"
@@ -1310,70 +2092,130 @@ if [[ -z "$KMS_KEY_ARN" ]]; then
   fi
 fi
 
-# ── IAM Role ─────────────────────────────────────────────────
 section "IAM Management Role"
-echo -e "  ${GRY}${ARW} aws iam list-roles --query contains('${PREFIX}')${RST}"
-ROLE_JSON=$(aws iam list-roles \
-  --query "Roles[?contains(RoleName,'${PREFIX}')].{Name:RoleName,Arn:Arn}" \
-  --output json 2>/dev/null || echo "[]")
-ROLE_ARNS=$(py   "import sys,json; [print(r['Arn']) for r in json.load(sys.stdin)]" <<< "$ROLE_JSON")
-ROLE_LBLS=$(py   "import sys,json; [print(f\"{r['Arn']}\") for r in json.load(sys.stdin)]" <<< "$ROLE_JSON")
-MGMT_ROLE_ARN=""
+# OLH needs two distinct roles and it matters which is which:
+#
+#   management role  - assumed by Qlik from outside your account, so its trust
+#                      policy names the Qlik proxy principal and requires your
+#                      tenant ExternalId. This is what the network integration
+#                      connects through.
+#   node role        - assumed by ec2.amazonaws.com, attached via the instance
+#                      profile, and carries the S3/Kinesis/KMS/Glue grants that
+#                      Terraform adds.
+#
+# Earlier versions of this wizard created only the EC2 role and reported it as
+# mgmt_role_arn, which left QTC with nothing it could assume.
 
-if [[ -n "$ROLE_ARNS" ]]; then
-  pick_resource "IAM Roles" "$ROLE_ARNS" "$ROLE_LBLS"
-  [[ -n "$REPLY" ]] && MGMT_ROLE_ARN="$REPLY" && echo -e "  ${GRN}${OK}  Using role: ${MGMT_ROLE_ARN}${RST}"
-fi
-if [[ -z "$MGMT_ROLE_ARN" ]]; then
-  echo -e "  ${YLW}  Creating ${PREFIX}-ec2-role-iam${RST}"
-  TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+MGMT_ROLE_NAME="${PREFIX}-mgmt-role-iam"
+NODE_ROLE_NAME="${PREFIX}-ec2-role-iam"
+
+echo -e "  ${GRY}${ARW} aws iam get-role --role-name ${MGMT_ROLE_NAME}${RST}"
+MGMT_TRUST=$(py "
+import json
+print(json.dumps({
+  'Version': '2012-10-17',
+  'Statement': [{
+    'Effect': 'Allow',
+    'Principal': {'AWS': '${QLIK_PROXY_ROLE_ARN}'},
+    'Action': 'sts:AssumeRole',
+    'Condition': {'StringEquals': {'sts:ExternalId': '${QTC_EXTERNAL_ID}'}}
+  }]
+}))
+")
+
+if aws iam get-role --role-name "$MGMT_ROLE_NAME" &>/dev/null; then
+  echo -e "  ${GRN}${OK}  Management role exists: ${MGMT_ROLE_NAME}${RST}"
+  if confirm "    Refresh its trust policy with the ExternalId you just entered?"; then
+    if ! $DRY_RUN; then
+      aws iam update-assume-role-policy --role-name "$MGMT_ROLE_NAME" \
+        --policy-document "$MGMT_TRUST" &>/dev/null \
+        && echo -e "  ${GRN}${OK}  Trust policy updated.${RST}" \
+        || echo -e "  ${YLW}${WRN}  Could not update the trust policy.${RST}"
+    else
+      echo -e "  ${YLW}[DRY-RUN] Would update the trust policy.${RST}"
+    fi
+  fi
+  MGMT_ROLE_ARN="arn:aws:iam::${ACCT_ID}:role/${MGMT_ROLE_NAME}"
+else
+  echo -e "  ${YLW}  Creating ${MGMT_ROLE_NAME}  (trusts ${QLIK_PROXY_ROLE_ARN})${RST}"
   if ! $DRY_RUN; then
-    aws iam create-role --role-name "${PREFIX}-ec2-role-iam" \
-      --assume-role-policy-document "$TRUST" \
+    aws iam create-role --role-name "$MGMT_ROLE_NAME" \
+      --description "Qlik Talend Cloud management role for ${PREFIX}" \
+      --assume-role-policy-document "$MGMT_TRUST" \
       --tags "Key=Owner,Value=${INITIALS}" "Key=Environment,Value=${ENV}" \
              "Key=Workload,Value=qlik-olh" "Key=CreateDate,Value=${CREATE_DATE}" \
              "Key=ManagedBy,Value=script" &>/dev/null
-    # Attach SSM Managed Instance Core policy
-    echo -e "  ${GRY}${ARW} Attaching AmazonSSMManagedInstanceCore policy${RST}"
-    aws iam attach-role-policy --role-name "${PREFIX}-ec2-role-iam" \
-      --policy-arn "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" &>/dev/null
-    MGMT_ROLE_ARN="arn:aws:iam::${ACCT_ID}:role/${PREFIX}-ec2-role-iam"
-    echo -e "  ${GRN}${OK}  Created: ${MGMT_ROLE_ARN}  (SSM Core policy attached)${RST}"
+    MGMT_ROLE_ARN="arn:aws:iam::${ACCT_ID}:role/${MGMT_ROLE_NAME}"
+    echo -e "  ${GRN}${OK}  Created: ${MGMT_ROLE_ARN}${RST}"
+    echo -e "  ${GRY}      Trust: ${QLIK_PROXY_ROLE_ARN} with sts:ExternalId${RST}"
   else
-    MGMT_ROLE_ARN="arn:aws:iam::${ACCT_ID}:role/${PREFIX}-ec2-role-iam-DRYRUN"
-    echo -e "  ${YLW}[DRY-RUN] Would create IAM role ${PREFIX}-ec2-role-iam${RST}"
+    MGMT_ROLE_ARN="arn:aws:iam::${ACCT_ID}:role/${MGMT_ROLE_NAME}-DRYRUN"
+    echo -e "  ${YLW}[DRY-RUN] Would create IAM management role ${MGMT_ROLE_NAME}${RST}"
+  fi
+fi
+
+# ── EC2 node role ────────────────────────────────────────────
+section "EC2 Node Role"
+NODE_TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
+if aws iam get-role --role-name "$NODE_ROLE_NAME" &>/dev/null; then
+  echo -e "  ${GRN}${OK}  Node role exists: ${NODE_ROLE_NAME}${RST}"
+  NODE_ROLE_ARN="arn:aws:iam::${ACCT_ID}:role/${NODE_ROLE_NAME}"
+else
+  echo -e "  ${YLW}  Creating ${NODE_ROLE_NAME}${RST}"
+  if ! $DRY_RUN; then
+    aws iam create-role --role-name "$NODE_ROLE_NAME" \
+      --description "Qlik Open Lakehouse EC2 node role for ${PREFIX}" \
+      --assume-role-policy-document "$NODE_TRUST" \
+      --tags "Key=Owner,Value=${INITIALS}" "Key=Environment,Value=${ENV}" \
+             "Key=Workload,Value=qlik-olh" "Key=CreateDate,Value=${CREATE_DATE}" \
+             "Key=ManagedBy,Value=script" &>/dev/null
+    echo -e "  ${GRY}${ARW} Attaching AmazonSSMManagedInstanceCore policy${RST}"
+    aws iam attach-role-policy --role-name "$NODE_ROLE_NAME" \
+      --policy-arn "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" &>/dev/null
+    NODE_ROLE_ARN="arn:aws:iam::${ACCT_ID}:role/${NODE_ROLE_NAME}"
+    echo -e "  ${GRN}${OK}  Created: ${NODE_ROLE_ARN}  (SSM Core attached)${RST}"
+    echo -e "  ${GRY}      Terraform adds the S3/Kinesis/KMS/Glue data-plane policy.${RST}"
+  else
+    NODE_ROLE_ARN="arn:aws:iam::${ACCT_ID}:role/${NODE_ROLE_NAME}-DRYRUN"
+    echo -e "  ${YLW}[DRY-RUN] Would create IAM node role ${NODE_ROLE_NAME}${RST}"
   fi
 fi
 
 # ── Instance Profile ─────────────────────────────────────────
 section "EC2 Instance Profile"
-echo -e "  ${GRY}${ARW} aws iam list-instance-profiles --query contains('${PREFIX}')${RST}"
-PROF_JSON=$(aws iam list-instance-profiles \
-  --query "InstanceProfiles[?contains(InstanceProfileName,'${PREFIX}')].{Name:InstanceProfileName,Arn:Arn}" \
-  --output json 2>/dev/null || echo "[]")
-PROF_ARNS=$(py "import sys,json; [print(p['Arn']) for p in json.load(sys.stdin)]" <<< "$PROF_JSON")
-PROF_LBLS=$(py "import sys,json; [print(p['Arn']) for p in json.load(sys.stdin)]" <<< "$PROF_JSON")
-INSTANCE_PROFILE_ARN=""
+PROFILE_NAME="${PREFIX}-instance-profile"
+echo -e "  ${GRY}${ARW} aws iam get-instance-profile --instance-profile-name ${PROFILE_NAME}${RST}"
 
-if [[ -n "$PROF_ARNS" ]]; then
-  pick_resource "Instance Profiles" "$PROF_ARNS" "$PROF_LBLS"
-  [[ -n "$REPLY" ]] && INSTANCE_PROFILE_ARN="$REPLY" && \
-    echo -e "  ${GRN}${OK}  Using: ${INSTANCE_PROFILE_ARN}${RST}"
-fi
-if [[ -z "$INSTANCE_PROFILE_ARN" ]]; then
-  echo -e "  ${YLW}  Creating ${PREFIX}-instance-profile${RST}"
+if aws iam get-instance-profile --instance-profile-name "$PROFILE_NAME" &>/dev/null; then
+  echo -e "  ${GRN}${OK}  Instance profile exists: ${PROFILE_NAME}${RST}"
+  INSTANCE_PROFILE_ARN="arn:aws:iam::${ACCT_ID}:instance-profile/${PROFILE_NAME}"
+  # Make sure the node role really is the one inside it.
+  PROF_ROLE=$(aws iam get-instance-profile --instance-profile-name "$PROFILE_NAME" \
+    --query "InstanceProfile.Roles[0].RoleName" --output text 2>/dev/null || echo "")
+  if [[ "$PROF_ROLE" != "$NODE_ROLE_NAME" && "$PROF_ROLE" != "None" && -n "$PROF_ROLE" ]]; then
+    echo -e "  ${YLW}${WRN}  It currently holds role '${PROF_ROLE}', not ${NODE_ROLE_NAME}.${RST}"
+  elif [[ -z "$PROF_ROLE" || "$PROF_ROLE" == "None" ]]; then
+    echo -e "  ${YLW}${WRN}  It holds no role - attaching ${NODE_ROLE_NAME}.${RST}"
+    if ! $DRY_RUN; then
+      aws iam add-role-to-instance-profile --instance-profile-name "$PROFILE_NAME" \
+        --role-name "$NODE_ROLE_NAME" &>/dev/null || true
+    fi
+  fi
+else
+  echo -e "  ${YLW}  Creating ${PROFILE_NAME}${RST}"
   if ! $DRY_RUN; then
     aws iam create-instance-profile \
-      --instance-profile-name "${PREFIX}-instance-profile" \
+      --instance-profile-name "$PROFILE_NAME" \
       --tags "Key=Owner,Value=${INITIALS}" "Key=Environment,Value=${ENV}" \
              "Key=CreateDate,Value=${CREATE_DATE}" &>/dev/null
     aws iam add-role-to-instance-profile \
-      --instance-profile-name "${PREFIX}-instance-profile" \
-      --role-name "${PREFIX}-ec2-role-iam" &>/dev/null
-    INSTANCE_PROFILE_ARN="arn:aws:iam::${ACCT_ID}:instance-profile/${PREFIX}-instance-profile"
-    echo -e "  ${GRN}${OK}  Created: ${INSTANCE_PROFILE_ARN}${RST}"
+      --instance-profile-name "$PROFILE_NAME" \
+      --role-name "$NODE_ROLE_NAME" &>/dev/null
+    INSTANCE_PROFILE_ARN="arn:aws:iam::${ACCT_ID}:instance-profile/${PROFILE_NAME}"
+    echo -e "  ${GRN}${OK}  Created: ${INSTANCE_PROFILE_ARN}  (role ${NODE_ROLE_NAME})${RST}"
   else
-    INSTANCE_PROFILE_ARN="arn:aws:iam::${ACCT_ID}:instance-profile/${PREFIX}-instance-profile-DRYRUN"
+    INSTANCE_PROFILE_ARN="arn:aws:iam::${ACCT_ID}:instance-profile/${PROFILE_NAME}-DRYRUN"
     echo -e "  ${YLW}[DRY-RUN] Would create instance profile${RST}"
   fi
 fi
@@ -1385,32 +2227,52 @@ header "Group 4 of 5  –  Storage & Streaming"
 
 create_or_use_bucket() {
   local bname="$1" label="$2"
-  echo -e "  ${GRY}${ARW} aws s3api head-bucket --bucket ${bname}${RST}"
+  echo -e "  ${GRY}${ARW} aws s3api head-bucket --bucket ${bname}${RST}" >&2
   if aws s3api head-bucket --bucket "$bname" --region "$REGION" &>/dev/null; then
-    echo -e "  ${GRN}${OK}  ${label} exists: ${bname}${RST}"
+    echo -e "  ${GRN}${OK}  ${label} exists: ${bname}${RST}" >&2
     confirm "    Use existing '${bname}'?" && { echo "$bname"; return; }
   else
-    echo -e "  ${YLW}${WRN}  ${label} not found.${RST}"
+    echo -e "  ${YLW}${WRN}  ${label} not found.${RST}" >&2
   fi
   prompt_val "    Bucket name for ${label}" "$bname" \
     "^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$" "Valid S3 bucket name."
   local bn="$REPLY"
   if ! $DRY_RUN; then
-    [[ "$REGION" == "us-east-1" ]] && \
-      aws s3api create-bucket --bucket "$bn" --region "$REGION" &>/dev/null || \
-      aws s3api create-bucket --bucket "$bn" --region "$REGION" \
-        --create-bucket-configuration "LocationConstraint=${REGION}" &>/dev/null
+    local cb_out=""
+    # us-east-1 rejects a LocationConstraint; every other region requires one.
+    # if/else, not `[[ ]] && A || B`: a real failure of A must not fall through
+    # to B and then be reported as success.
+    if [[ "$REGION" == "us-east-1" ]]; then
+      cb_out=$(aws s3api create-bucket --bucket "$bn" --region "$REGION" 2>&1) || {
+        echo -e "  ${RED}${ERR}  Could not create ${bn}:${RST}" >&2
+        echo -e "  ${GRY}      ${cb_out}${RST}" >&2
+        exit 1; }
+    else
+      cb_out=$(aws s3api create-bucket --bucket "$bn" --region "$REGION" \
+        --create-bucket-configuration "LocationConstraint=${REGION}" 2>&1) || {
+        echo -e "  ${RED}${ERR}  Could not create ${bn}:${RST}" >&2
+        echo -e "  ${GRY}      ${cb_out}${RST}" >&2
+        exit 1; }
+    fi
+    # Default encryption with the OLH CMK, not the AWS-managed aws/s3 key:
+    # Terraform grants the node role envelope encryption on this key, and
+    # S3 Bucket Keys cut per-object KMS calls.
+    local sse_cfg='{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"}}]}'
+    if [[ -n "${KMS_KEY_ARN:-}" ]]; then
+      sse_cfg="{\"Rules\":[{\"ApplyServerSideEncryptionByDefault\":{\"SSEAlgorithm\":\"aws:kms\",\"KMSMasterKeyID\":\"${KMS_KEY_ARN}\"},\"BucketKeyEnabled\":true}]}"
+    else
+      echo -e "  ${YLW}${WRN}  No CMK ARN yet - ${bn} falls back to the AWS-managed S3 key.${RST}" >&2
+    fi
     aws s3api put-bucket-encryption --bucket "$bn" \
-      --server-side-encryption-configuration \
-      '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"}}]}' &>/dev/null
+      --server-side-encryption-configuration "$sse_cfg" &>/dev/null
     aws s3api put-public-access-block --bucket "$bn" \
       --public-access-block-configuration \
       "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true" &>/dev/null
     aws s3api put-bucket-tagging --bucket "$bn" --tagging \
       "TagSet=[{Key=Owner,Value=${INITIALS}},{Key=Environment,Value=${ENV}},{Key=Workload,Value=qlik-olh},{Key=Application,Value=open-lakehouse},{Key=CreateDate,Value=${CREATE_DATE}},{Key=ManagedBy,Value=script}]" &>/dev/null
-    echo -e "  ${GRN}${OK}  Created: ${bn}  (KMS-encrypted, tags applied)${RST}"
+    echo -e "  ${GRN}${OK}  Created: ${bn}  (KMS-encrypted, tags applied)${RST}" >&2
   else
-    echo -e "  ${YLW}[DRY-RUN] Would create bucket: ${bn}${RST}"
+    echo -e "  ${YLW}[DRY-RUN] Would create bucket: ${bn}${RST}" >&2
   fi
   echo "$bn"
 }
@@ -1421,6 +2283,15 @@ S3_LANDING=$(create_or_use_bucket "${PREFIX}-landing-s3"  "Landing bucket")
 S3_CONFIG=$(create_or_use_bucket  "${PREFIX}-config-s3"   "Config bucket")
 create_or_use_bucket "$TFSTATE_BUCKET" "TF State bucket" > /dev/null
 
+# Terraform state benefits from versioning even though the lakehouse buckets
+# do not need it. The GCS path does the same for its state bucket.
+if ! $DRY_RUN; then
+  aws s3api put-bucket-versioning --bucket "$TFSTATE_BUCKET" --region "$REGION" \
+    --versioning-configuration Status=Enabled &>/dev/null \
+    && echo -e "  ${GRN}${OK}  Versioning enabled on ${TFSTATE_BUCKET}.${RST}" \
+    || echo -e "  ${YLW}${WRN}  Could not enable versioning on ${TFSTATE_BUCKET}.${RST}"
+fi
+
 section "Kinesis Stream"
 KINESIS_NAME="${PREFIX}-stream-kinesis"
 echo -e "  ${GRY}${ARW} aws kinesis describe-stream-summary --stream-name ${KINESIS_NAME}${RST}"
@@ -1430,14 +2301,14 @@ if aws kinesis describe-stream-summary --stream-name "$KINESIS_NAME" \
   confirm "    Use existing stream?" || {
     prompt_val "New stream name" "${KINESIS_NAME}-2" "^[a-zA-Z0-9_.-]+$" "Valid stream name."
     KINESIS_NAME="$REPLY"
-    dry_exec "aws kinesis create-stream --stream-name ${KINESIS_NAME} --shard-count 2 --region ${REGION}"
+    dry_exec "aws kinesis create-stream --stream-name ${KINESIS_NAME} --shard-count 1 --region ${REGION}"
     echo -e "  ${GRN}${OK}  Created: ${KINESIS_NAME}${RST}"
   }
 else
   echo -e "  ${YLW}${WRN}  Stream not found — creating.${RST}"
   if ! $DRY_RUN; then
     aws kinesis create-stream --stream-name "$KINESIS_NAME" \
-      --shard-count 2 --region "$REGION"
+      --shard-count 1 --region "$REGION"
     aws kinesis add-tags-to-stream --stream-name "$KINESIS_NAME" \
       --tags "Owner=${INITIALS},Environment=${ENV},Workload=qlik-olh,CreateDate=${CREATE_DATE}" \
       --region "$REGION" &>/dev/null
@@ -1447,14 +2318,23 @@ else
   fi
 fi
 
-################################################################
-#  GROUP 5 – Tagging Compliance Check
-################################################################
-header "Group 5 of 5  –  Tagging Compliance"
+fi   # end of the per-cloud provisioning branch
 
-declare -A REQ_TAGS=( [Owner]="$INITIALS" [Environment]="$ENV" [Workload]="qlik-olh" [Application]="open-lakehouse" [CreateDate]="$CREATE_DATE" [ManagedBy]="script" )
+################################################################
+#  GROUP 5 - Tagging / Labelling Compliance Check
+################################################################
+header "Group 5 of 5  -  Tagging Compliance"
+
+if [[ "$CLOUD" == "gcp" ]]; then
+  TAG_WORD="labels"
+  declare -A REQ_TAGS=( [owner]="$INITIALS" [environment]="$ENV" [workload]="qlik-olh" [application]="open-lakehouse" [createdate]="$CREATE_DATE" [managedby]="script" )
+else
+  TAG_WORD="tags"
+  declare -A REQ_TAGS=( [Owner]="$INITIALS" [Environment]="$ENV" [Workload]="qlik-olh" [Application]="open-lakehouse" [CreateDate]="$CREATE_DATE" [ManagedBy]="script" )
+fi
+
 ALL_COMPLIANT=true
-echo -e "  ${WHT}Required tags applied to all resources:${RST}\n"
+echo -e "  ${WHT}Required ${TAG_WORD} applied to all resources:${RST}\n"
 printf "  ${CYN}%-20s %-30s %s${RST}\n" "Key" "Value" "Status"
 echo "  $SEP"
 for k in "${!REQ_TAGS[@]}"; do
@@ -1467,47 +2347,75 @@ for k in "${!REQ_TAGS[@]}"; do
   fi
 done
 echo ""
-$ALL_COMPLIANT && echo -e "  ${GRN}${OK}  All required tags are compliant.${RST}" || \
-  echo -e "  ${RED}${ERR}  Tagging compliance failed. Fix before deploying.${RST}"
+$ALL_COMPLIANT && echo -e "  ${GRN}${OK}  All required ${TAG_WORD} are compliant.${RST}" || \
+  echo -e "  ${RED}${ERR}  Compliance failed. Fix before deploying.${RST}"
 
 ################################################################
-#  REVIEW — Pre-Deploy Summary
+#  REVIEW - Pre-Deploy Summary
 ################################################################
-header "Review — Deployment Summary"
-
-SUBNET_SUMMARY=""
-for pair in "${SUBNET_AZ_PAIRS[@]}"; do
-  sub="${pair%%|*}"; az="${pair##*|}"
-  SUBNET_SUMMARY+="    ${sub}  (${az})"$'\n'
-done
+header "Review - Deployment Summary"
 
 echo -e "  ${WHT}Please review the following configuration before proceeding:${RST}"
 echo ""
 printf "  ${CYN}%-28s %s${RST}\n" "Setting" "Value"
 echo "  $SEP"
+printf "  %-28s %s\n" "Target cloud" "$CLOUD_LABEL"
 printf "  %-28s %s\n" "Owner Initials" "$INITIALS"
 printf "  %-28s %s\n" "Workload" "$WORKLOAD"
 printf "  %-28s %s\n" "Environment" "$ENV"
 printf "  %-28s %s\n" "Region" "$REGION"
 printf "  %-28s %s\n" "Prefix" "$PREFIX"
-printf "  %-28s %s\n" "AWS Account" "$ACCT_ID"
-printf "  %-28s %s\n" "Caller ARN" "$CALLER"
-echo "  $SEP"
-printf "  %-28s %s\n" "VPC ID" "$VPC_ID"
-printf "  %-28s %s\n" "VPC CIDR" "$VPC_CIDR"
-printf "  %-28s %s\n" "Security Group" "$SG_ID"
-echo -e "  Subnets:"
-echo -n "$SUBNET_SUMMARY"
-echo "  $SEP"
-printf "  %-28s %s\n" "KMS Key ARN" "$KMS_KEY_ARN"
-printf "  %-28s %s\n" "IAM Role ARN" "$MGMT_ROLE_ARN"
-printf "  %-28s %s\n" "Instance Profile ARN" "$INSTANCE_PROFILE_ARN"
-echo "  $SEP"
-printf "  %-28s %s\n" "S3 Iceberg" "${S3_ICEBERG}"
-printf "  %-28s %s\n" "S3 Landing" "${S3_LANDING}"
-printf "  %-28s %s\n" "S3 Config" "${S3_CONFIG}"
-printf "  %-28s %s\n" "TF State Bucket" "${TFSTATE_BUCKET}"
-printf "  %-28s %s\n" "Kinesis Stream" "${KINESIS_NAME}"
+
+if [[ "$CLOUD" == "gcp" ]]; then
+  printf "  %-28s %s\n" "Project ID" "$GCP_PROJECT_ID"
+  printf "  %-28s %s\n" "Project number" "$GCP_PROJECT_NUMBER"
+  printf "  %-28s %s\n" "Authenticated as" "$CALLER"
+  printf "  %-28s %s\n" "Zones" "${GCP_ZONES[*]}"
+  echo "  $SEP"
+  printf "  %-28s %s\n" "VPC network" "$NETWORK_NAME"
+  printf "  %-28s %s\n" "Subnetwork" "$SUBNETWORK_NAME"
+  printf "  %-28s %s\n" "Subnetwork CIDR" "$SUBNETWORK_CIDR"
+  printf "  %-28s %s\n" "Firewall rule" "$FIREWALL_RULE"
+  printf "  %-28s %s\n" "Cloud NAT" "$NAT_NAME"
+  echo "  $SEP"
+  printf "  %-28s %s\n" "KMS key" "$KMS_KEY_ID"
+  printf "  %-28s %s\n" "Management SA" "$MGMT_SA"
+  printf "  %-28s %s\n" "Node SA" "$NODE_SA"
+  printf "  %-28s %s\n" "QTC auth method" "$QTC_AUTH_METHOD"
+  echo "  $SEP"
+  printf "  %-28s %s\n" "GCS table storage" "$GCS_TABLE"
+  printf "  %-28s %s\n" "GCS landing" "$GCS_LANDING"
+  printf "  %-28s %s\n" "GCS config" "$GCS_CONFIG"
+  printf "  %-28s %s\n" "TF state bucket" "$TFSTATE_BUCKET"
+  printf "  %-28s %s\n" "Streaming" "none (Private Preview: CDC + SaaS only)"
+else
+  SUBNET_SUMMARY=""
+  for pair in "${SUBNET_AZ_PAIRS[@]}"; do
+    sub="${pair%%|*}"; az="${pair##*|}"
+    SUBNET_SUMMARY+="    ${sub}  (${az})"$'\n'
+  done
+  printf "  %-28s %s\n" "AWS Account" "$ACCT_ID"
+  printf "  %-28s %s\n" "Caller ARN" "$CALLER"
+  echo "  $SEP"
+  printf "  %-28s %s\n" "VPC ID" "$VPC_ID"
+  printf "  %-28s %s\n" "VPC CIDR" "$VPC_CIDR"
+  printf "  %-28s %s\n" "Security Group" "$SG_ID"
+  printf "  %-28s %s\n" "S3 gateway endpoint" "${S3_VPCE_ID:-(Terraform will create)}"
+  echo -e "  Subnets:"
+  echo -n "$SUBNET_SUMMARY"
+  echo "  $SEP"
+  printf "  %-28s %s\n" "KMS Key ARN" "$KMS_KEY_ARN"
+  printf "  %-28s %s\n" "Management Role ARN" "$MGMT_ROLE_ARN"
+  printf "  %-28s %s\n" "Node Role ARN" "$NODE_ROLE_ARN"
+  printf "  %-28s %s\n" "Instance Profile ARN" "$INSTANCE_PROFILE_ARN"
+  printf "  %-28s %s\n" "Qlik proxy principal" "$QLIK_PROXY_ROLE_ARN"
+  echo "  $SEP"
+  printf "  %-28s %s\n" "S3 Iceberg" "${S3_ICEBERG}"
+  printf "  %-28s %s\n" "S3 Landing" "${S3_LANDING}"
+  printf "  %-28s %s\n" "S3 Config" "${S3_CONFIG}"
+  printf "  %-28s %s\n" "TF State Bucket" "${TFSTATE_BUCKET}"
+  printf "  %-28s %s\n" "Kinesis Stream" "${KINESIS_NAME}  (1 shard)"
+fi
 echo "  $SEP"
 echo ""
 MODE_DESC="LIVE"
@@ -1524,34 +2432,94 @@ fi
 ################################################################
 header "Writing Output Files"
 
-TFVARS="terraform.tfvars"
-SUBNET_BLOCK=""
-for pair in "${SUBNET_AZ_PAIRS[@]}"; do
-  sub="${pair%%|*}"; az="${pair##*|}"
-  SUBNET_BLOCK+="    Subnet: ${sub}   AZ: ${az}"$'\n'
-done
+# SCRIPT_DIR / TF_PATH / TFVARS are resolved at the top of the script.
+mkdir -p "$TF_PATH"
 
-# terraform.tfvars
-cat > "$TFVARS" <<EOF
-# Generated by discover-qlik-lakehouse.sh
+if [[ "$CLOUD" == "gcp" ]]; then
+  ZONES_HCL=""
+  for z in "${GCP_ZONES[@]}"; do
+    ZONES_HCL+="${ZONES_HCL:+, }\"${z}\""
+  done
+
+  cat > "$TFVARS" <<EOF
+# Generated by qlik_deploy_olh.sh
 # $(date "+%Y-%m-%d %H:%M:%S")
-# Mode: $( $DRY_RUN && echo "DRY-RUN" || echo "LIVE")
+# Cloud: Google Cloud   Mode: $( $DRY_RUN && echo "DRY-RUN" || echo "LIVE")
+#
+# Contains your QTC tenant ID. Keep it out of source control.
 
-initials             = "${INITIALS}"
-workload             = "${WORKLOAD}"
-env                  = "${ENV}"
-aws_region           = "${REGION}"
-aws_account_id       = "${ACCT_ID}"
-tfstate_bucket       = "${TFSTATE_BUCKET}"
-vpc_id               = "${VPC_ID}"
-vpc_cidr             = "${VPC_CIDR}"
-kinesis_stream_name  = "${KINESIS_NAME}"
-kinesis_shards       = 2
-s3_bucket_name       = "${S3_ICEBERG}"
-security_group_id    = "${SG_ID}"
-kms_key_arn          = "${KMS_KEY_ARN}"
-mgmt_role_arn        = "${MGMT_ROLE_ARN}"
-instance_profile_arn = "${INSTANCE_PROFILE_ARN}"
+initials                   = "${INITIALS}"
+workload                   = "${WORKLOAD}"
+env                        = "${ENV}"
+
+gcp_project_id             = "${GCP_PROJECT_ID}"
+gcp_project_number         = "${GCP_PROJECT_NUMBER}"
+gcp_region                 = "${GCP_REGION}"
+gcp_zones                  = [${ZONES_HCL}]
+tfstate_bucket             = "${TFSTATE_BUCKET}"
+
+network_name               = "${NETWORK_NAME}"
+subnetwork_name            = "${SUBNETWORK_NAME}"
+subnetwork_cidr            = "${SUBNETWORK_CIDR}"
+firewall_rule_name         = "${FIREWALL_RULE}"
+
+kms_key_id                 = "${KMS_KEY_ID}"
+mgmt_service_account_email = "${MGMT_SA}"
+node_service_account_email = "${NODE_SA}"
+
+qtc_auth_method            = "${QTC_AUTH_METHOD}"
+qtc_oidc_issuer_uri        = "${QTC_OIDC_ISSUER}"
+qtc_tenant_id              = "${QTC_TENANT_ID}"
+
+gcs_table_bucket           = "${GCS_TABLE}"
+gcs_landing_bucket         = "${GCS_LANDING}"
+gcs_config_bucket          = "${GCS_CONFIG}"
+
+# Labels
+tag_owner      = "${INITIALS}"
+tag_env        = "${ENV}"
+tag_workload   = "qlik-olh"
+tag_createdate = "${CREATE_DATE}"
+EOF
+else
+  SUBNET_IDS_HCL=""
+  for pair in "${SUBNET_AZ_PAIRS[@]}"; do
+    sub="${pair%%|*}"
+    SUBNET_IDS_HCL+="${SUBNET_IDS_HCL:+, }\"${sub}\""
+  done
+
+  cat > "$TFVARS" <<EOF
+# Generated by qlik_deploy_olh.sh
+# $(date "+%Y-%m-%d %H:%M:%S")
+# Cloud: AWS   Mode: $( $DRY_RUN && echo "DRY-RUN" || echo "LIVE")
+#
+# Contains your QTC ExternalId. Keep it out of source control.
+
+initials               = "${INITIALS}"
+workload               = "${WORKLOAD}"
+env                    = "${ENV}"
+aws_region             = "${REGION}"
+aws_account_id         = "${ACCT_ID}"
+tfstate_bucket         = "${TFSTATE_BUCKET}"
+
+vpc_id                 = "${VPC_ID}"
+vpc_cidr               = "${VPC_CIDR}"
+subnet_ids             = [${SUBNET_IDS_HCL}]
+security_group_id      = "${SG_ID}"
+s3_gateway_endpoint_id = "${S3_VPCE_ID}"
+
+kms_key_arn            = "${KMS_KEY_ARN}"
+mgmt_role_arn          = "${MGMT_ROLE_ARN}"
+node_role_arn          = "${NODE_ROLE_ARN}"
+instance_profile_arn   = "${INSTANCE_PROFILE_ARN}"
+qlik_proxy_role_arn    = "${QLIK_PROXY_ROLE_ARN}"
+qtc_external_id        = "${QTC_EXTERNAL_ID}"
+
+s3_bucket_name         = "${S3_ICEBERG}"
+s3_landing_bucket      = "${S3_LANDING}"
+s3_config_bucket       = "${S3_CONFIG}"
+kinesis_stream_name    = "${KINESIS_NAME}"
+kinesis_shards         = 1
 
 # Tags
 tag_owner      = "${INITIALS}"
@@ -1559,13 +2527,81 @@ tag_env        = "${ENV}"
 tag_workload   = "qlik-olh"
 tag_createdate = "${CREATE_DATE}"
 EOF
-echo -e "  ${GRN}${OK}  terraform.tfvars${RST}"
+fi
+echo -e "  ${GRN}${OK}  ${TFVARS}${RST}"
 
-# qlik-network-integration.txt
-QTC_FILE="qlik-network-integration.txt"
-cat > "$QTC_FILE" <<EOF
+# ── QTC reference file ───────────────────────────────────────
+QTC_FILE="${SCRIPT_DIR}/qlik-network-integration.txt"
+if [[ "$CLOUD" == "gcp" ]]; then
+  cat > "$QTC_FILE" <<EOF
 $(printf '=%.0s' {1..64})
-  Qlik Open Lakehouse – QTC Network Integration Reference
+  Qlik Open Lakehouse - QTC Network Integration Reference
+  Cloud      : Google Cloud  (Private Preview)
+  Generated  : $(date "+%Y-%m-%d %H:%M:%S")
+  Prefix     : ${PREFIX}
+  Mode       : $( $DRY_RUN && echo "DRY-RUN" || echo "LIVE")
+$(printf '=%.0s' {1..64})
+
+${SEP}
+  ENTITY                         VALUE
+${SEP}
+  Project ID                   : ${GCP_PROJECT_ID}
+  Project Number               : ${GCP_PROJECT_NUMBER}
+  Region                       : ${GCP_REGION}
+  Zones                        : ${GCP_ZONES[*]}
+  VPC Network                  : ${NETWORK_NAME}
+  Subnetwork                   : ${SUBNETWORK_NAME}
+  Subnetwork CIDR              : ${SUBNETWORK_CIDR}
+  Firewall Rule                : ${FIREWALL_RULE}
+  Cloud NAT                    : ${NAT_NAME}
+  Cloud KMS Key                : ${KMS_KEY_ID}
+  Management Service Account   : ${MGMT_SA}
+  Node Service Account         : ${NODE_SA}
+  GCS Table Storage Bucket     : ${GCS_TABLE}
+  GCS Landing Bucket           : ${GCS_LANDING}
+  GCS Config Bucket            : ${GCS_CONFIG}
+  QTC Auth Method              : ${QTC_AUTH_METHOD}
+${SEP}
+
+  APPLIED LABELS
+${SEP}
+  owner         : ${INITIALS}
+  environment   : ${ENV}
+  workload      : qlik-olh
+  application   : open-lakehouse
+  createdate    : ${CREATE_DATE}
+  managedby     : script
+${SEP}
+
+  CREATED BY TERRAFORM
+${SEP}
+  BigLake Catalog  : ${INITIALS}_${WORKLOAD}_${ENV}_catalog
+  BigLake Database : ${INITIALS}_${WORKLOAD}_${ENV}_db
+  BigQuery Mirror  : ${INITIALS}_${WORKLOAD}_${ENV}_mirror
+  Secret prefix    : ${INITIALS}-${WORKLOAD}-${ENV}
+${SEP}
+
+  PREVIEW NOTES
+${SEP}
+  * Private Preview opened 2 Sep 2026; GA planned Q4 2026.
+  * Ingestion scope at launch: CDC and SaaS sources only.
+    Streaming (Kafka / GCS) and Qlik Replicate sources arrive later.
+  * Zero-copy mirroring to BigQuery is a Google Cloud only feature.
+  * The QTC authentication model on GCP is not yet published. This run
+    configured '${QTC_AUTH_METHOD}' - confirm it against your preview
+    onboarding pack before treating it as final.
+${SEP}
+EOF
+else
+  SUBNET_BLOCK=""
+  for pair in "${SUBNET_AZ_PAIRS[@]}"; do
+    sub="${pair%%|*}"; az="${pair##*|}"
+    SUBNET_BLOCK+="    Subnet: ${sub}   AZ: ${az}"$'\n'
+  done
+  cat > "$QTC_FILE" <<EOF
+$(printf '=%.0s' {1..64})
+  Qlik Open Lakehouse - QTC Network Integration Reference
+  Cloud      : AWS
   Generated  : $(date "+%Y-%m-%d %H:%M:%S")
   Prefix     : ${PREFIX}
   Mode       : $( $DRY_RUN && echo "DRY-RUN" || echo "LIVE")
@@ -1584,7 +2620,9 @@ ${SUBNET_BLOCK}
   S3 Bucket Name               : ${S3_ICEBERG}
   Kinesis Stream Name          : ${KINESIS_NAME}
   Security Group ID            : ${SG_ID}
+  S3 Gateway VPC Endpoint      : ${S3_VPCE_ID:-created by Terraform}
   Management Role ARN          : ${MGMT_ROLE_ARN}
+  Node Role ARN                : ${NODE_ROLE_ARN}
   Instance Profile ARN         : ${INSTANCE_PROFILE_ARN}
 ${SEP}
 
@@ -1603,18 +2641,72 @@ ${SEP}
   S3 Iceberg    : ${S3_ICEBERG}
   S3 Landing    : ${S3_LANDING}
   S3 Config     : ${S3_CONFIG}
-  IAM Role      : ${PREFIX}-ec2-role-iam
+  Mgmt Role     : ${PREFIX}-mgmt-role-iam
+  Node Role     : ${PREFIX}-ec2-role-iam
   Glue Database : ${INITIALS}_${WORKLOAD}_${ENV}_db_glue
   SSM Path      : /${INITIALS}/${WORKLOAD}/${ENV}
 ${SEP}
 EOF
-echo -e "  ${GRN}${OK}  qlik-network-integration.txt${RST}"
+fi
+echo -e "  ${GRN}${OK}  ${QTC_FILE}${RST}"
 
-# HTML Deployment Report
-RPT_FILE="deploy-report.html"
+# ── HTML deployment report ───────────────────────────────────
+RPT_FILE="${SCRIPT_DIR}/deploy-report.html"
+if [[ "$CLOUD" == "gcp" ]]; then
+  RPT_NET_ROWS="<div class=\"k\">VPC Network</div><div class=\"v\">${NETWORK_NAME}</div>
+  <div class=\"k\">Subnetwork</div><div class=\"v\">${SUBNETWORK_NAME}</div>
+  <div class=\"k\">Subnetwork CIDR</div><div class=\"v\">${SUBNETWORK_CIDR}</div>
+  <div class=\"k\">Firewall Rule</div><div class=\"v\">${FIREWALL_RULE}</div>
+  <div class=\"k\">Cloud NAT</div><div class=\"v\">${NAT_NAME}</div>
+  <div class=\"k\">Zones</div><div class=\"v\">${GCP_ZONES[*]}</div>"
+  RPT_SEC_ROWS="<div class=\"k\">Cloud KMS Key</div><div class=\"v\">${KMS_KEY_ID}</div>
+  <div class=\"k\">Management SA</div><div class=\"v\">${MGMT_SA}</div>
+  <div class=\"k\">Node SA</div><div class=\"v\">${NODE_SA}</div>
+  <div class=\"k\">QTC Auth Method</div><div class=\"v\">${QTC_AUTH_METHOD}</div>"
+  RPT_STO_ROWS="<div class=\"k\">GCS Table Storage</div><div class=\"v\">${GCS_TABLE}</div>
+  <div class=\"k\">GCS Landing</div><div class=\"v\">${GCS_LANDING}</div>
+  <div class=\"k\">GCS Config</div><div class=\"v\">${GCS_CONFIG}</div>
+  <div class=\"k\">Streaming</div><div class=\"v\">none &mdash; Private Preview covers CDC and SaaS sources</div>"
+  RPT_GEN_ROWS="<div class=\"k\">BigLake Catalog</div><div class=\"v\">${INITIALS}_${WORKLOAD}_${ENV}_catalog</div>
+  <div class=\"k\">BigLake Database</div><div class=\"v\">${INITIALS}_${WORKLOAD}_${ENV}_db</div>
+  <div class=\"k\">BigQuery Mirror</div><div class=\"v\">${INITIALS}_${WORKLOAD}_${ENV}_mirror</div>
+  <div class=\"k\">TF State Bucket</div><div class=\"v\">${TFSTATE_BUCKET}</div>"
+  RPT_TAGS="owner|environment|workload|application|createdate|managedby"
+  RPT_EXTRA_CHIP='<span class="chip warn">Google Cloud &mdash; Private Preview</span>'
+  RPT_SUB="Prefix: ${PREFIX} &nbsp;|&nbsp; Project: ${GCP_PROJECT_ID} &nbsp;|&nbsp; Region: ${GCP_REGION}"
+else
+  SUBNET_HTML=""
+  for pair in "${SUBNET_AZ_PAIRS[@]}"; do
+    sub="${pair%%|*}"; az="${pair##*|}"
+    SUBNET_HTML+="${sub} (${az})<br/>"
+  done
+  RPT_NET_ROWS="<div class=\"k\">VPC ID</div><div class=\"v\">${VPC_ID}</div>
+  <div class=\"k\">VPC CIDR</div><div class=\"v\">${VPC_CIDR}</div>
+  <div class=\"k\">Security Group</div><div class=\"v\">${SG_ID}</div>
+  <div class=\"k\">S3 Gateway Endpoint</div><div class=\"v\">${S3_VPCE_ID:-created by Terraform}</div>
+  <div class=\"k\">Subnets / AZs</div><div class=\"v\">${SUBNET_HTML}</div>"
+  RPT_SEC_ROWS="<div class=\"k\">KMS Key ARN</div><div class=\"v\">${KMS_KEY_ARN}</div>
+  <div class=\"k\">Management Role</div><div class=\"v\">${MGMT_ROLE_ARN}</div>
+  <div class=\"k\">Node Role</div><div class=\"v\">${NODE_ROLE_ARN}</div>
+  <div class=\"k\">Instance Profile</div><div class=\"v\">${INSTANCE_PROFILE_ARN}</div>
+  <div class=\"k\">Qlik Proxy Principal</div><div class=\"v\">${QLIK_PROXY_ROLE_ARN}</div>"
+  RPT_STO_ROWS="<div class=\"k\">S3 Iceberg</div><div class=\"v\">${S3_ICEBERG}</div>
+  <div class=\"k\">S3 Landing</div><div class=\"v\">${S3_LANDING}</div>
+  <div class=\"k\">S3 Config</div><div class=\"v\">${S3_CONFIG}</div>
+  <div class=\"k\">Kinesis Stream</div><div class=\"v\">${KINESIS_NAME} (1 shard)</div>"
+  RPT_GEN_ROWS="<div class=\"k\">Glue Database</div><div class=\"v\">${INITIALS}_${WORKLOAD}_${ENV}_db_glue</div>
+  <div class=\"k\">SSM Path</div><div class=\"v\">/${INITIALS}/${WORKLOAD}/${ENV}</div>
+  <div class=\"k\">TF State Bucket</div><div class=\"v\">${TFSTATE_BUCKET}</div>"
+  RPT_TAGS="Owner|Environment|Workload|Application|CreateDate|ManagedBy"
+  RPT_EXTRA_CHIP=''
+  RPT_SUB="Prefix: ${PREFIX} &nbsp;|&nbsp; Account: ${ACCT_ID} &nbsp;|&nbsp; Region: ${REGION}"
+fi
+
+IFS='|' read -r T1 T2 T3 T4 T5 T6 <<< "$RPT_TAGS"
+
 cat > "$RPT_FILE" <<EOF
 <!DOCTYPE html><html><head><meta charset="UTF-8">
-<title>Qlik OLH Deploy Report – ${PREFIX}</title>
+<title>Qlik OLH Deploy Report - ${PREFIX}</title>
 <style>
 body{font-family:Segoe UI,sans-serif;background:#f5f7f5;color:#1f2328;padding:24px;max-width:900px;margin:auto}
 h1{color:#fff;background:#194268;padding:14px 20px;border-radius:8px;margin-bottom:16px;font-size:18px}
@@ -1630,70 +2722,72 @@ h1 small{font-size:12px;opacity:.8;display:block;margin-top:4px}
 .chip{padding:3px 12px;border-radius:10px;font-size:12px;font-weight:600}
 .ok{background:#dafbe1;color:#116329}.warn{background:#fff8c5;color:#9a6700}
 </style></head><body>
-<h1>Qlik Open Lakehouse — Deployment Report<small>Prefix: ${PREFIX} &nbsp;|&nbsp; Region: ${REGION} &nbsp;|&nbsp; $(date)</small></h1>
+<h1>Qlik Open Lakehouse - Deployment Report<small>${CLOUD_LABEL} &nbsp;|&nbsp; ${RPT_SUB} &nbsp;|&nbsp; $(date)</small></h1>
 <div class="section"><h2>Status</h2><div class="chips">
-  <span class="chip ok">✔ Deployment Complete</span>
-  <span class="chip ok">✔ Tags Compliant</span>
-  $( $DRY_RUN && echo '<span class="chip warn">⚠ Dry-Run Mode</span>' || echo '<span class="chip ok">✔ Live Mode</span>')
+  <span class="chip ok">Resources Provisioned</span>
+  $( $ALL_COMPLIANT && echo '<span class="chip ok">Tagging Compliant</span>' || echo '<span class="chip warn">Tagging Non-Compliant</span>')
+  ${RPT_EXTRA_CHIP}
+  $( $DRY_RUN && echo '<span class="chip warn">Dry-Run Mode</span>' || echo '<span class="chip ok">Live Mode</span>')
 </div></div>
 <div class="section"><h2>Network</h2><div class="grid">
-  <div class="k">VPC ID</div><div class="v">${VPC_ID}</div>
-  <div class="k">VPC CIDR</div><div class="v">${VPC_CIDR}</div>
-  <div class="k">Security Group</div><div class="v">${SG_ID}</div>
-  <div class="k">Subnets / AZs</div><div class="v">${SUBNET_BLOCK//$'\n'/<br/>}</div>
+  ${RPT_NET_ROWS}
 </div></div>
 <div class="section"><h2>Security &amp; Encryption</h2><div class="grid">
-  <div class="k">KMS Key ARN</div><div class="v">${KMS_KEY_ARN}</div>
-  <div class="k">Management Role</div><div class="v">${MGMT_ROLE_ARN}</div>
-  <div class="k">Instance Profile</div><div class="v">${INSTANCE_PROFILE_ARN}</div>
+  ${RPT_SEC_ROWS}
 </div></div>
 <div class="section"><h2>Storage &amp; Streaming</h2><div class="grid">
-  <div class="k">S3 Iceberg</div><div class="v">${S3_ICEBERG}</div>
-  <div class="k">S3 Landing</div><div class="v">${S3_LANDING}</div>
-  <div class="k">S3 Config</div><div class="v">${S3_CONFIG}</div>
-  <div class="k">Kinesis Stream</div><div class="v">${KINESIS_NAME}</div>
+  ${RPT_STO_ROWS}
 </div></div>
-<div class="section"><h2>Applied Tags</h2><div class="tags">
-  <span class="tag">Owner: ${INITIALS}</span>
-  <span class="tag">Environment: ${ENV}</span>
-  <span class="tag">Workload: qlik-olh</span>
-  <span class="tag">Application: open-lakehouse</span>
-  <span class="tag">CreateDate: ${CREATE_DATE}</span>
-  <span class="tag">ManagedBy: script</span>
+<div class="section"><h2>Applied $( [[ "$CLOUD" == "gcp" ]] && echo "Labels" || echo "Tags")</h2><div class="tags">
+  <span class="tag">${T1}: ${INITIALS}</span>
+  <span class="tag">${T2}: ${ENV}</span>
+  <span class="tag">${T3}: qlik-olh</span>
+  <span class="tag">${T4}: open-lakehouse</span>
+  <span class="tag">${T5}: ${CREATE_DATE}</span>
+  <span class="tag">${T6}: script</span>
 </div></div>
-<div class="section"><h2>Generated Names</h2><div class="grid">
-  <div class="k">IAM Role</div><div class="v">${PREFIX}-ec2-role-iam</div>
-  <div class="k">Glue Database</div><div class="v">${INITIALS}_${WORKLOAD}_${ENV}_db_glue</div>
-  <div class="k">SSM Path</div><div class="v">/${INITIALS}/${WORKLOAD}/${ENV}</div>
-  <div class="k">TF State Bucket</div><div class="v">${TFSTATE_BUCKET}</div>
+<div class="section"><h2>Created by Terraform</h2><div class="grid">
+  ${RPT_GEN_ROWS}
 </div></div>
 </body></html>
 EOF
-echo -e "  ${GRN}${OK}  deploy-report.html${RST}"
+echo -e "  ${GRN}${OK}  ${RPT_FILE}${RST}"
 
 ################################################################
 #  TERRAFORM
 ################################################################
-if ! $DRY_RUN; then
-  header "Terraform Init → Plan → Apply"
-  echo -e "  ${GRY}${ARW} terraform init${RST}"
-  terraform init -reconfigure \
-    -backend-config="bucket=${TFSTATE_BUCKET}" \
-    -backend-config="key=qlik-lakehouse/terraform.tfstate" \
-    -backend-config="region=${REGION}"
-  abort_on_fail $? "terraform init failed."
+if ! $DRY_RUN && [[ "$TERRAFORM_OK" == "true" ]]; then
+  header "Terraform Init -> Plan -> Apply  (${TF_DIR})"
+
+  echo -e "  ${GRY}${ARW} terraform -chdir=${TF_DIR} init${RST}"
+  if [[ "$CLOUD" == "gcp" ]]; then
+    terraform -chdir="$TF_PATH" init -reconfigure \
+      -backend-config="bucket=${TFSTATE_BUCKET}" \
+      -backend-config="prefix=qlik-lakehouse" || abort_on_fail $? "terraform init failed."
+  else
+    terraform -chdir="$TF_PATH" init -reconfigure \
+      -backend-config="bucket=${TFSTATE_BUCKET}" \
+      -backend-config="key=qlik-lakehouse/terraform.tfstate" \
+      -backend-config="region=${REGION}" || abort_on_fail $? "terraform init failed."
+  fi
   echo -e "  ${GRN}${OK}  Init complete.${RST}\n"
 
-  echo -e "  ${GRY}${ARW} terraform plan${RST}"
-  terraform plan -var-file="$TFVARS" -out="tfplan"
-  abort_on_fail $? "terraform plan failed."
-  echo -e "  ${GRN}${OK}  Plan saved to tfplan.${RST}\n"
+  echo -e "  ${GRY}${ARW} terraform -chdir=${TF_DIR} plan${RST}"
+  terraform -chdir="$TF_PATH" plan -var-file="terraform.tfvars" -out="tfplan" \
+    || abort_on_fail $? "terraform plan failed."
+  echo -e "  ${GRN}${OK}  Plan saved to ${TF_DIR}/tfplan.${RST}\n"
 
   if confirm "  Apply the plan now?"; then
-    terraform apply "tfplan"
-    abort_on_fail $? "terraform apply failed."
+    terraform -chdir="$TF_PATH" apply "tfplan" || abort_on_fail $? "terraform apply failed."
     echo -e "  ${GRN}${OK}  Apply complete!${RST}"
+    echo ""
+    echo -e "  ${CYN}QTC integration values:${RST}"
+    terraform -chdir="$TF_PATH" output qtc_summary || true
   fi
+elif $DRY_RUN; then
+  echo -e "\n  ${YLW}[DRY-RUN] Skipping terraform init/plan/apply.${RST}"
+else
+  echo -e "\n  ${YLW}${WRN}  Terraform not available - skipping init/plan/apply.${RST}"
 fi
 
 ################################################################
@@ -1701,9 +2795,9 @@ fi
 ################################################################
 header "Complete"
 echo -e "  ${GRN}${OK}  Output files:${RST}"
-echo -e "  ${GRY}    • terraform.tfvars${RST}"
-echo -e "  ${GRY}    • qlik-network-integration.txt${RST}"
-echo -e "  ${GRY}    • deploy-report.html${RST}"
+echo -e "  ${GRY}    - ${TF_DIR}/terraform.tfvars${RST}"
+echo -e "  ${GRY}    - qlik-network-integration.txt${RST}"
+echo -e "  ${GRY}    - deploy-report.html${RST}"
 echo ""
 echo -e "  ${CYN}Opening qlik-network-integration.txt ...${RST}"
 if   command -v xdg-open &>/dev/null; then xdg-open "$QTC_FILE" &
@@ -1712,7 +2806,18 @@ else cat "$QTC_FILE"; fi
 
 echo ""
 echo -e "  ${WHT}Next steps:${RST}"
-echo -e "  ${GRY}    1. Copy values from qlik-network-integration.txt into QTC${RST}"
-echo -e "  ${GRY}    2. Create Network Integration in Qlik Talend Cloud${RST}"
-echo -e "  ${GRY}    3. Configure Lakehouse Cluster + Glue catalog connection${RST}"
+if [[ "$CLOUD" == "gcp" ]]; then
+  echo -e "  ${GRY}    1. Copy values from qlik-network-integration.txt into QTC${RST}"
+  echo -e "  ${GRY}    2. Create the Network Integration in Qlik Talend Cloud${RST}"
+  echo -e "  ${GRY}    3. Create the Lakehouse Cluster (Spot VM MIG across ${GCP_ZONES[*]})${RST}"
+  echo -e "  ${GRY}    4. Connect the Google Lakehouse Runtime Catalog${RST}"
+  echo -e "  ${GRY}    5. Optional: enable zero-copy mirroring into BigQuery${RST}"
+  echo ""
+  echo -e "  ${YLW}  Reminder: your tenant must be enrolled in the Google Cloud Private${RST}"
+  echo -e "  ${YLW}  Preview before a lakehouse cluster can be created.${RST}"
+else
+  echo -e "  ${GRY}    1. Copy values from qlik-network-integration.txt into QTC${RST}"
+  echo -e "  ${GRY}    2. Create Network Integration in Qlik Talend Cloud${RST}"
+  echo -e "  ${GRY}    3. Configure Lakehouse Cluster + Glue catalog connection${RST}"
+fi
 echo ""
