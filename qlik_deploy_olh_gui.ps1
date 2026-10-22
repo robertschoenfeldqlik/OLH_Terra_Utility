@@ -164,9 +164,14 @@ function Invoke-AwsCmd {
         $psi.UseShellExecute        = $false
         $psi.CreateNoWindow         = $true
         $proc = [System.Diagnostics.Process]::Start($psi)
-        $stdout = $proc.StandardOutput.ReadToEnd()
-        $stderr = $proc.StandardError.ReadToEnd()
+        # Drain both pipes asynchronously BEFORE WaitForExit -- reading one to
+        # end while the other fills its 4 KB buffer deadlocks both processes.
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
         $proc.WaitForExit()
+        $stdout = ""; $stderr = ""
+        try { if ($outTask.Wait(5000)) { $stdout = $outTask.Result } } catch { }
+        try { if ($errTask.Wait(5000)) { $stderr = $errTask.Result } } catch { }
         if ($proc.ExitCode -ne 0) {
             if (-not $Silent -and $stderr) { Write-LogRed "  !! $stderr" }
             return $null
@@ -526,6 +531,9 @@ function Show-InstallDialog {
 
         $success = $false
         $errMsg  = $null
+        # Hard cap on package-manager installs: the window is hidden, so a
+        # stalled winget/choco would otherwise freeze the wizard indefinitely.
+        $installTimeoutMs = 600000
 
         try {
             if ($rbWinget.Checked) {
@@ -534,13 +542,25 @@ function Show-InstallDialog {
                 [System.Windows.Forms.Application]::DoEvents()
                 $psi = New-Object System.Diagnostics.ProcessStartInfo
                 $psi.FileName = "winget"
-                $psi.Arguments = "install --id $pkgId --exact --silent --accept-package-agreements --accept-source-agreements"
+                # --disable-interactivity: the window is hidden, so any prompt
+                # winget raises would sit there unseen forever.
+                $psi.Arguments = "install --id $pkgId --exact --silent --disable-interactivity --accept-package-agreements --accept-source-agreements"
                 $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
                 $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
                 $proc = [System.Diagnostics.Process]::Start($psi)
-                $stdout = $proc.StandardOutput.ReadToEnd()
-                $stderr = $proc.StandardError.ReadToEnd()
-                $proc.WaitForExit()
+                # Drain both pipes asynchronously BEFORE WaitForExit -- winget's
+                # progress output fills the undrained buffer and deadlocks both.
+                $outTask = $proc.StandardOutput.ReadToEndAsync()
+                $errTask = $proc.StandardError.ReadToEndAsync()
+                if (-not $proc.WaitForExit($installTimeoutMs)) {
+                    try { $proc.Kill() } catch { }
+                    throw "winget did not finish within $([int]($installTimeoutMs / 60000)) minutes. Run 'winget install --id $pkgId' in a terminal to see what it is waiting on."
+                }
+                # Bounded waits: a grandchild installer can hold the pipe open
+                # after winget itself has exited.
+                $stdout = ""; $stderr = ""
+                try { if ($outTask.Wait(5000)) { $stdout = $outTask.Result } } catch { }
+                try { if ($errTask.Wait(5000)) { $stderr = $errTask.Result } } catch { }
                 # winget exit codes: 0 = OK, -1978335189 = no applicable update, others = fail
                 if ($proc.ExitCode -ne 0) {
                     $errMsg = "winget exit $($proc.ExitCode). $($stderr.Trim()) $($stdout.Trim())".Trim()
@@ -553,13 +573,21 @@ function Show-InstallDialog {
                 $lblProg.Text = "Running: choco install $pkgId -y ..."
                 [System.Windows.Forms.Application]::DoEvents()
                 $psi = New-Object System.Diagnostics.ProcessStartInfo
-                $psi.FileName = "choco"; $psi.Arguments = "install $pkgId -y"
+                # --no-progress: choco's progress bar is the output that fills
+                # the pipe; -y already covers the prompts.
+                $psi.FileName = "choco"; $psi.Arguments = "install $pkgId -y --no-progress"
                 $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
                 $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
                 $proc = [System.Diagnostics.Process]::Start($psi)
-                $stdout = $proc.StandardOutput.ReadToEnd()
-                $stderr = $proc.StandardError.ReadToEnd()
-                $proc.WaitForExit()
+                $outTask = $proc.StandardOutput.ReadToEndAsync()
+                $errTask = $proc.StandardError.ReadToEndAsync()
+                if (-not $proc.WaitForExit($installTimeoutMs)) {
+                    try { $proc.Kill() } catch { }
+                    throw "choco did not finish within $([int]($installTimeoutMs / 60000)) minutes. Run 'choco install $pkgId -y' in a terminal to see what it is waiting on."
+                }
+                $stdout = ""; $stderr = ""
+                try { if ($outTask.Wait(5000)) { $stdout = $outTask.Result } } catch { }
+                try { if ($errTask.Wait(5000)) { $stderr = $errTask.Result } } catch { }
                 if ($proc.ExitCode -ne 0) {
                     $errMsg = "choco exit $($proc.ExitCode). $($stderr.Trim()) $($stdout.Trim())".Trim()
                 }
@@ -636,11 +664,26 @@ function Show-InstallDialog {
                     $psi.FileName = "msiexec.exe"
                     $psi.Arguments = "/i `"$msiPath`" /qn /norestart /l*v `"$logPath`""
                     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
-                    $proc = [System.Diagnostics.Process]::Start($psi)
-                    $proc.WaitForExit()
+                    # 1618 = ERROR_INSTALL_ALREADY_RUNNING. Another Windows
+                    # Installer transaction (Windows Update, a winget install)
+                    # holds the global mutex; it usually clears within a minute.
+                    $msiExit = 0
+                    for ($attempt = 1; $attempt -le 3; $attempt++) {
+                        $proc = [System.Diagnostics.Process]::Start($psi)
+                        $proc.WaitForExit()
+                        $msiExit = $proc.ExitCode
+                        if ($msiExit -ne 1618) { break }
+                        if ($attempt -lt 3) {
+                            $lblProg.Text = "Another Windows Installer is running; retrying in 20s ($attempt/3)..."
+                            [System.Windows.Forms.Application]::DoEvents()
+                            Start-Sleep -Seconds 20
+                        }
+                    }
                     Remove-Item $msiPath -Force -ErrorAction SilentlyContinue
-                    if ($proc.ExitCode -ne 0) {
-                        $errMsg = "msiexec exit $($proc.ExitCode). See log: $logPath"
+                    if ($msiExit -eq 1618) {
+                        $errMsg = "Another Windows Installer is already running (msiexec 1618). Wait for it to finish - or reboot if nothing is visibly installing - then retry."
+                    } elseif ($msiExit -ne 0) {
+                        $errMsg = "msiexec exit $msiExit. See log: $logPath"
                     }
                     $success = Refresh-Path-And-Find "aws"
                 }
