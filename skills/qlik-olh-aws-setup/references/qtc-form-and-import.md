@@ -34,15 +34,26 @@ same shape back.
 | 2 | Advanced settings > Use a proxy server | `useProxy` | |
 | 3 Create a lakehouse cluster | Cluster name | `clusterName` | |
 | 3 | Space | `clusterSpaceId` | |
-| 3 | Cluster capabilities | `clusterCapabilities` | **CDC workloads = `"database"`** (confirmed). Streaming workloads: value not yet observed |
+| 3 | Cluster capabilities | `clusterCapabilities` | **CDC workloads = `"database"`** (from a real export). **Streaming workloads = `"streaming"`** (form radio value and API `clusterCapabilities.type` on a live streaming cluster) |
 | 3 | Tags (key/value, *Add*) | `tags: [{key, value}]` | applied to the cluster's EC2 instances |
 | 3 | Custom image | `useCustomImage` | |
 | 3 | Rollout phase | `rolloutPhaseType` | **Early rollout = `"early-rollout"`** (confirmed). Later rollout: value not yet observed |
 | — | (implicit) | `providerType` | `"aws"` |
 
+**Tested import behaviour (2026-10-22):**
+- A complete file imports with all three sections *Complete* and the space
+  resolved from `spaceId`.
+- A **blank** `spaceId` / `clusterSpaceId` does not make the form ask: it silently
+  uses **Default_Data_Space** for both the integration and the cluster, shows
+  every section Complete, and leaves Confirm enabled. That is why `olh_emit.py`
+  refuses to run without a `space_id`.
+- `networkIntegrationName` must be unique in the tenant; a duplicate shows
+  "Network integration name is already in use" and Confirm stays disabled.
+
 `olh_emit.py` only maps the confirmed enum values. To use Streaming or Later
 rollout, export the form once with that option selected, read the value, and
-pass it as `cluster_capability_raw` / `rollout_raw` in the config.
+pass it as `cluster_capability_raw` / `rollout_raw` in the config. (Streaming is
+now mapped; Later rollout is not.)
 
 There is **no** field for Kinesis, the ExternalId, a Glue database, or the
 iceberg/landing buckets. The ExternalId lives only in the management role's trust
@@ -79,6 +90,21 @@ Both return a bare JSON **array**, newest first:
 UI statuses seen: integration *Deploying → Connecting → Connected* (or *Failed*);
 cluster *Connecting → Running*.
 
+Each cluster's `deploymentConfig` carries `clusterCapabilities.type`
+(`database` | `streaming`), `instanceAllocationStrategy` (`type: ephemeral`,
+`minimumInstances`, `maximumInstances`, `scalingStrategy.type`: `low-cost` |
+`low-latency` | `consistent-low-latency` | `manual-scaling`), `tags`, and
+`rolloutPhase.type` (`use-network-integration-rollout` for clusters).
+
+## The separate *Create lakehouse cluster* dialog
+
+Lakehouse clusters tab > **Create new**. Fields: Name, Network integration,
+Space, Cluster capabilities, **Family type** (Type, Size), **Instances**
+(AWS On-Demand count; AWS Spot Minimum/Maximum), **Scaling strategy**, Tags.
+Unlike the integration form, this one exposes sizing. Type/Size lists stay
+near-empty until an integration is selected; then Type offers `r`, `x` and Size
+`2xlarge` … `96xlarge`, `metal*`. Defaults: On-Demand 0, Spot 1/1, Low latency.
+
 ## What Qlik builds in your account after Confirm
 
 Two Auto Scaling groups named `qlik_<uuid>` (min = max = desired = 1) with
@@ -87,7 +113,7 @@ Two Auto Scaling groups named `qlik_<uuid>` (min = max = desired = 1) with
 | Role (tag `qlik_cluster_type`) | Instance seen | Purchase |
 |---|---|---|
 | `GatewayCluster` — the network integration agent | r8i-flex.xlarge | on-demand |
-| `LakehouseCluster` — the cluster | r8a.2xlarge | Spot |
+| `LakehouseCluster` — the cluster | r8a.2xlarge (CDC) / r8i-flex.2xlarge (Streaming, r/2xlarge chosen) | Spot |
 
 The form exposes no instance-size setting; this pair is the floor. Instances
 carry your cluster tags plus `qlik_cluster`, `qlik_cluster_id`,

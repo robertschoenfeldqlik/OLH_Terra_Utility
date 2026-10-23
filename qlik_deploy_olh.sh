@@ -1625,6 +1625,39 @@ prompt_val "Qlik proxy role ARN" "" "^arn:aws[a-z-]*:iam::[0-9]{12}:(role|user)/
 QLIK_PROXY_ROLE_ARN="$REPLY"
 echo -e "  ${GRN}${OK}  Management role will trust ${QLIK_PROXY_ROLE_ARN} with your ExternalId.${RST}"
 
+# Values that only the Qlik Cloud "Create AWS network integration" form uses.
+# Nothing in AWS depends on them; they go into the import file and the
+# reference files. Drift and teardown never write those files, so skip them.
+if ! $DRIFT_ONLY && ! $TEARDOWN; then
+  section "Qlik Cloud Network Integration Form"
+  echo -e "  ${GRY}  Written to the import file the form's Import configuration button loads.${RST}"
+  echo ""
+  # Both notes were observed on the live form's Import configuration.
+  QTC_NAME_UNIQUE_MSG="The name must be unique in the tenant - an existing name shows \"Network integration name is already in use\" and Confirm stays disabled."
+  QTC_SPACE_BLANK_MSG="Space not set - the form will default to Default_Data_Space for both the integration and the cluster; change both before pressing Confirm."
+
+  echo -e "  ${GRY}  ${QTC_NAME_UNIQUE_MSG}${RST}"
+  prompt_val "Network integration name" "$PREFIX" "^[A-Za-z0-9][A-Za-z0-9._-]*$" \
+    "Letters, digits, '.', '_' and '-' (the name also names the import file)."
+  QTC_INTEGRATION_NAME="$REPLY"
+
+  echo -e "  ${GRY}  Qlik space ID (optional). In a browser signed in to the tenant, open${RST}"
+  echo -e "  ${GRY}    GET https://<tenant>/api/v1/spaces?name=<space name>${RST}"
+  echo -e "  ${GRY}  and copy the space's \"id\". If left blank the form defaults both spaces${RST}"
+  echo -e "  ${GRY}  to Default_Data_Space.${RST}"
+  prompt_val "Qlik space ID" "" "^[A-Za-z0-9]*$" \
+    "Letters and digits only, e.g. 0123456789abcdef01234567 - or leave blank."
+  QTC_SPACE_ID="$REPLY"
+
+  prompt_val "Cluster name" "${PREFIX}-cluster" "^[A-Za-z0-9][A-Za-z0-9._-]*$" \
+    "Letters, digits, '.', '_' and '-'."
+  QTC_CLUSTER_NAME="$REPLY"
+  echo -e "  ${GRN}${OK}  Import file: ${QTC_INTEGRATION_NAME}_AWS_import.json  (CDC workloads, Early rollout)${RST}"
+  if [[ -z "$QTC_SPACE_ID" ]]; then
+    echo -e "  ${YLW}${WRN}  ${QTC_SPACE_BLANK_MSG}${RST}"
+  fi
+fi
+
 ################################################################
 #  PRE-FLIGHT — Permission & Duplicate Guard
 ################################################################
@@ -2530,6 +2563,100 @@ EOF
 fi
 echo -e "  ${GRN}${OK}  ${TFVARS}${RST}"
 
+# ── Qlik Cloud form values (AWS) ─────────────────────────────
+# Shared by the reference file, the HTML report and the import JSON. Labels,
+# order and value mapping follow the live "Create AWS network integration"
+# form and its "Export form" file (both captured 2026-10-22).
+
+# write_aws_import_json <file>
+# Writes the JSON the form's Import configuration button loads. Key order and
+# values match the form's own "Export form" output; the bytes match
+# skills/qlik-olh-aws-setup/scripts/olh_emit.py for the same inputs (same
+# json.dumps(indent=2) + newline, same open() call). Only CDC workloads
+# ("database") and Early rollout ("early-rollout") have been seen in a real
+# export, so those are the only values written.
+# Values travel on stdin, NUL-separated: Git Bash rewrites argv and env values
+# that start with '/' before a native Windows Python sees them.
+write_aws_import_json() {
+  printf '%s\0' \
+    "$QTC_INTEGRATION_NAME" "$QTC_SPACE_ID" "$ACCT_ID" "$KMS_KEY_ARN" "$S3_CONFIG" \
+    "$MGMT_ROLE_ARN" "$INSTANCE_PROFILE_ARN" "$REGION" "$VPC_ID" \
+    "$QTC_CLUSTER_NAME" "$SG_ID" "$PREFIX" "${SUBNET_AZ_PAIRS[@]}" \
+  | "$PY" -c '
+import json, sys
+v = sys.stdin.buffer.read().decode("utf-8").split("\0")[:-1]
+name, space, acct, kms, bucket, mgmt, profile, region, vpc, cluster, sg, prefix = v[:12]
+subnets = []
+for pair in v[12:]:
+    az = pair.rsplit("|", 1)[-1]
+    # The form keeps only the zone letter, e.g. "a" for us-east-1a.
+    subnets.append({"availabilityZone": az[-1:], "subnet": pair.split("|", 1)[0]})
+imp = {
+    "providerType": "aws",
+    "networkIntegrationName": name,
+    "spaceId": space,
+    "awsAccount": acct,
+    "symmetricKmsKey": kms,
+    "bucketName": bucket,
+    "defaultManagementRole": mgmt,
+    # EC2 instances profile: the instance-profile ARN, not the node role ARN.
+    "defaultDataAccessRole": profile,
+    "region": region,
+    "vpcId": vpc,
+    "keyPairName": None,
+    "useProxy": False,
+    "clusterName": cluster,
+    "clusterSpaceId": space,
+    "clusterCapabilities": "database",
+    "useCustomImage": False,
+    "rolloutPhaseType": "early-rollout",
+    "subnetIds": subnets,
+    "securityGroupIds": [{"securityGroupId": sg}],
+    "tags": [{"key": "Name", "value": cluster}, {"key": "Workload", "value": prefix}],
+}
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    f.write(json.dumps(imp, indent=2) + "\n")
+' "$1"
+}
+
+# html_escape_into <prefix> VAR...
+# Sets <prefix>VAR to the HTML-escaped value of each named variable, in one
+# Python call. Same stdin route as above, for the same reason (the SSM path
+# starts with '/').
+html_escape_into() {
+  local _pfx="$1" _v _i=0; shift
+  local -a _esc=()
+  mapfile -d '' -t _esc < <(
+    for _v in "$@"; do printf '%s\0' "${!_v}"; done | "$PY" -c '
+import html, sys
+for v in sys.stdin.buffer.read().decode("utf-8").split("\0")[:-1]:
+    sys.stdout.buffer.write(html.escape(v).encode("utf-8") + b"\0")
+')
+  for _v in "$@"; do printf -v "${_pfx}${_v}" '%s' "${_esc[_i]-}"; _i=$((_i+1)); done
+}
+
+if [[ "$CLOUD" != "gcp" ]]; then
+  QI_IMPORT_NAME="${QTC_INTEGRATION_NAME}_AWS_import.json"
+  QI_IMPORT_FILE="${SCRIPT_DIR}/${QI_IMPORT_NAME}"
+  if [[ -n "$QTC_SPACE_ID" ]]; then
+    QI_SPACE_ROW="${QTC_SPACE_ID} (space ID)"
+  else
+    QI_SPACE_ROW="not set - form defaults to Default_Data_Space; change before Confirm"
+  fi
+  # The form's Availability Zone field holds only the zone letter.
+  QI_AZ_ROWS=()
+  for pair in "${SUBNET_AZ_PAIRS[@]}"; do
+    sub="${pair%%|*}"; az="${pair##*|}"
+    QI_AZ_ROWS+=("${az: -1} / ${sub}  (${az})")
+  done
+  QI_TAG_ROWS=("Name = ${QTC_CLUSTER_NAME}" "Workload = ${PREFIX}")
+  QI_APPLIED_TAGS=("Owner = ${INITIALS}" "Environment = ${ENV}" "Workload = qlik-olh"
+                   "Application = open-lakehouse" "CreateDate = ${CREATE_DATE}" "ManagedBy = script")
+  QI_VPCE_SHOW="${S3_VPCE_ID:-created by Terraform}"
+  QI_GLUE_DB="${INITIALS}_${WORKLOAD}_${ENV}_db_glue"
+  QI_SSM_PATH="/${INITIALS}/${WORKLOAD}/${ENV}"
+fi
+
 # ── QTC reference file ───────────────────────────────────────
 QTC_FILE="${SCRIPT_DIR}/qlik-network-integration.txt"
 if [[ "$CLOUD" == "gcp" ]]; then
@@ -2593,60 +2720,77 @@ ${SEP}
 ${SEP}
 EOF
 else
-  SUBNET_BLOCK=""
-  for pair in "${SUBNET_AZ_PAIRS[@]}"; do
-    sub="${pair%%|*}"; az="${pair##*|}"
-    SUBNET_BLOCK+="    Subnet: ${sub}   AZ: ${az}"$'\n'
-  done
-  cat > "$QTC_FILE" <<EOF
-$(printf '=%.0s' {1..64})
-  Qlik Open Lakehouse - QTC Network Integration Reference
-  Cloud      : AWS
-  Generated  : $(date "+%Y-%m-%d %H:%M:%S")
-  Prefix     : ${PREFIX}
-  Mode       : $( $DRY_RUN && echo "DRY-RUN" || echo "LIVE")
-$(printf '=%.0s' {1..64})
+  # qi_row <label> <value> [value ...]: extra values go on continuation lines.
+  qi_row() {
+    printf '  %-38s : %s\n' "$1" "${2-}"
+    local v; for v in "${@:3}"; do printf '  %-38s   %s\n' "" "$v"; done
+  }
+  qi_head() { printf '\n  %s\n%s\n' "$1" "$SEP"; }
+  {
+    printf '=%.0s' {1..64}; echo
+    echo "  Qlik Open Lakehouse - QTC Network Integration Reference"
+    echo "  Cloud      : AWS"
+    echo "  Generated  : $(date "+%Y-%m-%d %H:%M:%S")"
+    echo "  Prefix     : ${PREFIX}"
+    echo "  Mode       : $( $DRY_RUN && echo "DRY-RUN" || echo "LIVE")"
+    printf '=%.0s' {1..64}; echo
+    echo ""
+    echo "  Qlik Cloud form: Create AWS network integration. The sections and"
+    echo "  labels below follow the form, top to bottom."
+    echo ""
+    echo "  Import file : ${QI_IMPORT_NAME}  (next to this file)"
+    echo "  Load it via : Administration > Lakehouse clusters > Network integrations >"
+    echo "                Create network integration > Import configuration"
+    echo "  Then check each section against the values below before pressing Confirm."
+    echo ""
+    echo "  NOTE: ${QTC_NAME_UNIQUE_MSG}"
+    if [[ -z "$QTC_SPACE_ID" ]]; then
+      echo "  NOTE: ${QTC_SPACE_BLANK_MSG}"
+    fi
 
-${SEP}
-  ENTITY                         VALUE
-${SEP}
-  AWS Account ID               : ${ACCT_ID}
-  VPC ID                       : ${VPC_ID}
-  CIDR Range of VPC            : ${VPC_CIDR}
+    qi_head "DETAILS"
+    qi_row "Network integration name" "$QTC_INTEGRATION_NAME"
+    qi_row "Integration space" "$QI_SPACE_ROW"
+    echo "$SEP"
 
-  Subnet / Availability Zone pairs:
-${SUBNET_BLOCK}
-  Symmetric KMS Key ARN        : ${KMS_KEY_ARN}
-  S3 Bucket Name               : ${S3_ICEBERG}
-  Kinesis Stream Name          : ${KINESIS_NAME}
-  Security Group ID            : ${SG_ID}
-  S3 Gateway VPC Endpoint      : ${S3_VPCE_ID:-created by Terraform}
-  Management Role ARN          : ${MGMT_ROLE_ARN}
-  Node Role ARN                : ${NODE_ROLE_ARN}
-  Instance Profile ARN         : ${INSTANCE_PROFILE_ARN}
-${SEP}
+    qi_head "1. GRANT QLIK ACCESS TO YOUR CLOUD"
+    qi_row "AWS account" "$ACCT_ID"
+    qi_row "Symmetric KMS key ARN" "$KMS_KEY_ARN"
+    qi_row "S3 bucket for internal Qlik files" "$S3_CONFIG"
+    qi_row "Management role" "$MGMT_ROLE_ARN"
+    qi_row "EC2 instances profile" "$INSTANCE_PROFILE_ARN"
+    echo "$SEP"
 
-  APPLIED TAGS
-${SEP}
-  Owner         : ${INITIALS}
-  Environment   : ${ENV}
-  Workload      : qlik-olh
-  Application   : open-lakehouse
-  CreateDate    : ${CREATE_DATE}
-  ManagedBy     : script
-${SEP}
+    qi_head "2. CONNECT QLIK TO YOUR NETWORK"
+    qi_row "Region" "$REGION"
+    qi_row "VPC ID" "$VPC_ID"
+    qi_row "Availability Zone / Subnet" "${QI_AZ_ROWS[@]}"
+    qi_row "Security groups" "$SG_ID"
+    qi_row "EC2 key pair name" "None"
+    qi_row "Advanced settings > Use a proxy server" "off"
+    echo "$SEP"
 
-  GENERATED RESOURCE NAMES
-${SEP}
-  S3 Iceberg    : ${S3_ICEBERG}
-  S3 Landing    : ${S3_LANDING}
-  S3 Config     : ${S3_CONFIG}
-  Mgmt Role     : ${PREFIX}-mgmt-role-iam
-  Node Role     : ${PREFIX}-ec2-role-iam
-  Glue Database : ${INITIALS}_${WORKLOAD}_${ENV}_db_glue
-  SSM Path      : /${INITIALS}/${WORKLOAD}/${ENV}
-${SEP}
-EOF
+    qi_head "3. CREATE A LAKEHOUSE CLUSTER"
+    qi_row "Cluster name" "$QTC_CLUSTER_NAME"
+    qi_row "Space" "$QI_SPACE_ROW"
+    qi_row "Cluster capabilities" "CDC workloads"
+    qi_row "Tags" "${QI_TAG_ROWS[@]}"
+    qi_row "Custom image" "off"
+    qi_row "Rollout phase" "Early rollout"
+    echo "$SEP"
+
+    qi_head "ALSO CREATED (not asked for by the form)"
+    qi_row "Node role ARN" "$NODE_ROLE_ARN"
+    qi_row "S3 Iceberg bucket" "$S3_ICEBERG"
+    qi_row "S3 Landing bucket" "$S3_LANDING"
+    qi_row "TF state bucket" "$TFSTATE_BUCKET"
+    qi_row "Kinesis stream" "${KINESIS_NAME}  (1 shard)"
+    qi_row "S3 gateway VPC endpoint" "$QI_VPCE_SHOW"
+    qi_row "Glue database" "$QI_GLUE_DB"
+    qi_row "SSM path" "$QI_SSM_PATH"
+    qi_row "Applied tags" "${QI_APPLIED_TAGS[@]}"
+    echo "$SEP"
+  } > "$QTC_FILE"
 fi
 echo -e "  ${GRN}${OK}  ${QTC_FILE}${RST}"
 
@@ -2675,31 +2819,24 @@ if [[ "$CLOUD" == "gcp" ]]; then
   RPT_EXTRA_CHIP='<span class="chip warn">Google Cloud &mdash; Private Preview</span>'
   RPT_SUB="Prefix: ${PREFIX} &nbsp;|&nbsp; Project: ${GCP_PROJECT_ID} &nbsp;|&nbsp; Region: ${GCP_REGION}"
 else
-  SUBNET_HTML=""
-  for pair in "${SUBNET_AZ_PAIRS[@]}"; do
-    sub="${pair%%|*}"; az="${pair##*|}"
-    SUBNET_HTML+="${sub} (${az})<br/>"
-  done
-  RPT_NET_ROWS="<div class=\"k\">VPC ID</div><div class=\"v\">${VPC_ID}</div>
-  <div class=\"k\">VPC CIDR</div><div class=\"v\">${VPC_CIDR}</div>
-  <div class=\"k\">Security Group</div><div class=\"v\">${SG_ID}</div>
-  <div class=\"k\">S3 Gateway Endpoint</div><div class=\"v\">${S3_VPCE_ID:-created by Terraform}</div>
-  <div class=\"k\">Subnets / AZs</div><div class=\"v\">${SUBNET_HTML}</div>"
-  RPT_SEC_ROWS="<div class=\"k\">KMS Key ARN</div><div class=\"v\">${KMS_KEY_ARN}</div>
-  <div class=\"k\">Management Role</div><div class=\"v\">${MGMT_ROLE_ARN}</div>
-  <div class=\"k\">Node Role</div><div class=\"v\">${NODE_ROLE_ARN}</div>
-  <div class=\"k\">Instance Profile</div><div class=\"v\">${INSTANCE_PROFILE_ARN}</div>
-  <div class=\"k\">Qlik Proxy Principal</div><div class=\"v\">${QLIK_PROXY_ROLE_ARN}</div>"
-  RPT_STO_ROWS="<div class=\"k\">S3 Iceberg</div><div class=\"v\">${S3_ICEBERG}</div>
-  <div class=\"k\">S3 Landing</div><div class=\"v\">${S3_LANDING}</div>
-  <div class=\"k\">S3 Config</div><div class=\"v\">${S3_CONFIG}</div>
-  <div class=\"k\">Kinesis Stream</div><div class=\"v\">${KINESIS_NAME} (1 shard)</div>"
-  RPT_GEN_ROWS="<div class=\"k\">Glue Database</div><div class=\"v\">${INITIALS}_${WORKLOAD}_${ENV}_db_glue</div>
-  <div class=\"k\">SSM Path</div><div class=\"v\">/${INITIALS}/${WORKLOAD}/${ENV}</div>
-  <div class=\"k\">TF State Bucket</div><div class=\"v\">${TFSTATE_BUCKET}</div>"
+  NL=$'\n'
+  QI_AZ_TEXT="";  for r in "${QI_AZ_ROWS[@]}";  do QI_AZ_TEXT+="${QI_AZ_TEXT:+$NL}${r}";   done
+  QI_TAG_TEXT=""; for r in "${QI_TAG_ROWS[@]}"; do QI_TAG_TEXT+="${QI_TAG_TEXT:+$NL}${r}"; done
+  html_escape_into H_ QTC_INTEGRATION_NAME QI_SPACE_ROW ACCT_ID KMS_KEY_ARN S3_CONFIG \
+    MGMT_ROLE_ARN INSTANCE_PROFILE_ARN REGION VPC_ID QI_AZ_TEXT SG_ID QTC_CLUSTER_NAME \
+    QI_TAG_TEXT NODE_ROLE_ARN S3_ICEBERG S3_LANDING TFSTATE_BUCKET KINESIS_NAME \
+    QI_VPCE_SHOW QI_GLUE_DB QI_SSM_PATH INITIALS ENV CREATE_DATE PREFIX \
+    QI_IMPORT_NAME QTC_SPACE_BLANK_MSG
+  # Line breaks go in after escaping, so the <br/> survives.
+  H_QI_AZ_TEXT="${H_QI_AZ_TEXT//$NL/<br/>}"
+  H_QI_TAG_TEXT="${H_QI_TAG_TEXT//$NL/<br/>}"
   RPT_TAGS="Owner|Environment|Workload|Application|CreateDate|ManagedBy"
-  RPT_EXTRA_CHIP=''
-  RPT_SUB="Prefix: ${PREFIX} &nbsp;|&nbsp; Account: ${ACCT_ID} &nbsp;|&nbsp; Region: ${REGION}"
+  RPT_EXTRA_CHIP="<span class=\"chip ok\">Import file: ${H_QI_IMPORT_NAME}</span>"
+  if [[ -z "$QTC_SPACE_ID" ]]; then
+    RPT_EXTRA_CHIP+="
+  <span class=\"chip warn\">${H_QTC_SPACE_BLANK_MSG}</span>"
+  fi
+  RPT_SUB="Prefix: ${H_PREFIX} &nbsp;|&nbsp; Account: ${H_ACCT_ID} &nbsp;|&nbsp; Region: ${H_REGION}"
 fi
 
 IFS='|' read -r T1 T2 T3 T4 T5 T6 <<< "$RPT_TAGS"
@@ -2729,6 +2866,9 @@ h1 small{font-size:12px;opacity:.8;display:block;margin-top:4px}
   ${RPT_EXTRA_CHIP}
   $( $DRY_RUN && echo '<span class="chip warn">Dry-Run Mode</span>' || echo '<span class="chip ok">Live Mode</span>')
 </div></div>
+EOF
+if [[ "$CLOUD" == "gcp" ]]; then
+  cat >> "$RPT_FILE" <<EOF
 <div class="section"><h2>Network</h2><div class="grid">
   ${RPT_NET_ROWS}
 </div></div>
@@ -2738,7 +2878,7 @@ h1 small{font-size:12px;opacity:.8;display:block;margin-top:4px}
 <div class="section"><h2>Storage &amp; Streaming</h2><div class="grid">
   ${RPT_STO_ROWS}
 </div></div>
-<div class="section"><h2>Applied $( [[ "$CLOUD" == "gcp" ]] && echo "Labels" || echo "Tags")</h2><div class="tags">
+<div class="section"><h2>Applied Labels</h2><div class="tags">
   <span class="tag">${T1}: ${INITIALS}</span>
   <span class="tag">${T2}: ${ENV}</span>
   <span class="tag">${T3}: qlik-olh</span>
@@ -2749,9 +2889,66 @@ h1 small{font-size:12px;opacity:.8;display:block;margin-top:4px}
 <div class="section"><h2>Created by Terraform</h2><div class="grid">
   ${RPT_GEN_ROWS}
 </div></div>
-</body></html>
 EOF
+else
+  cat >> "$RPT_FILE" <<EOF
+<div class="section"><h2>Details</h2><div class="grid">
+  <div class="k">Network integration name</div><div class="v">${H_QTC_INTEGRATION_NAME}</div>
+  <div class="k">Integration space</div><div class="v">${H_QI_SPACE_ROW}</div>
+</div></div>
+<div class="section"><h2>1. Grant Qlik access to your cloud</h2><div class="grid">
+  <div class="k">AWS account</div><div class="v">${H_ACCT_ID}</div>
+  <div class="k">Symmetric KMS key ARN</div><div class="v">${H_KMS_KEY_ARN}</div>
+  <div class="k">S3 bucket for internal Qlik files</div><div class="v">${H_S3_CONFIG}</div>
+  <div class="k">Management role</div><div class="v">${H_MGMT_ROLE_ARN}</div>
+  <div class="k">EC2 instances profile</div><div class="v">${H_INSTANCE_PROFILE_ARN}</div>
+</div></div>
+<div class="section"><h2>2. Connect Qlik to your network</h2><div class="grid">
+  <div class="k">Region</div><div class="v">${H_REGION}</div>
+  <div class="k">VPC ID</div><div class="v">${H_VPC_ID}</div>
+  <div class="k">Availability Zone / Subnet</div><div class="v">${H_QI_AZ_TEXT}</div>
+  <div class="k">Security groups</div><div class="v">${H_SG_ID}</div>
+  <div class="k">EC2 key pair name</div><div class="v">None</div>
+  <div class="k">Advanced settings &gt; Use a proxy server</div><div class="v">off</div>
+</div></div>
+<div class="section"><h2>3. Create a lakehouse cluster</h2><div class="grid">
+  <div class="k">Cluster name</div><div class="v">${H_QTC_CLUSTER_NAME}</div>
+  <div class="k">Space</div><div class="v">${H_QI_SPACE_ROW}</div>
+  <div class="k">Cluster capabilities</div><div class="v">CDC workloads</div>
+  <div class="k">Tags</div><div class="v">${H_QI_TAG_TEXT}</div>
+  <div class="k">Custom image</div><div class="v">off</div>
+  <div class="k">Rollout phase</div><div class="v">Early rollout</div>
+</div></div>
+<div class="section"><h2>Also created</h2><div class="grid">
+  <div class="k">Node role ARN</div><div class="v">${H_NODE_ROLE_ARN}</div>
+  <div class="k">S3 Iceberg bucket</div><div class="v">${H_S3_ICEBERG}</div>
+  <div class="k">S3 Landing bucket</div><div class="v">${H_S3_LANDING}</div>
+  <div class="k">TF state bucket</div><div class="v">${H_TFSTATE_BUCKET}</div>
+  <div class="k">Kinesis stream</div><div class="v">${H_KINESIS_NAME} (1 shard)</div>
+  <div class="k">S3 gateway VPC endpoint</div><div class="v">${H_QI_VPCE_SHOW}</div>
+  <div class="k">Glue database</div><div class="v">${H_QI_GLUE_DB}</div>
+  <div class="k">SSM path</div><div class="v">${H_QI_SSM_PATH}</div>
+</div><div class="tags">
+  <span class="tag">${T1}: ${H_INITIALS}</span>
+  <span class="tag">${T2}: ${H_ENV}</span>
+  <span class="tag">${T3}: qlik-olh</span>
+  <span class="tag">${T4}: open-lakehouse</span>
+  <span class="tag">${T5}: ${H_CREATE_DATE}</span>
+  <span class="tag">${T6}: script</span>
+</div></div>
+EOF
+fi
+echo '</body></html>' >> "$RPT_FILE"
 echo -e "  ${GRN}${OK}  ${RPT_FILE}${RST}"
+
+# ── Qlik Cloud import file (AWS) ─────────────────────────────
+if [[ "$CLOUD" != "gcp" ]]; then
+  if write_aws_import_json "$QI_IMPORT_FILE"; then
+    echo -e "  ${GRN}${OK}  ${QI_IMPORT_FILE}${RST}"
+  else
+    echo -e "  ${YLW}${WRN}  Could not write ${QI_IMPORT_FILE} - fill the form from qlik-network-integration.txt.${RST}"
+  fi
+fi
 
 ################################################################
 #  TERRAFORM
@@ -2798,6 +2995,9 @@ echo -e "  ${GRN}${OK}  Output files:${RST}"
 echo -e "  ${GRY}    - ${TF_DIR}/terraform.tfvars${RST}"
 echo -e "  ${GRY}    - qlik-network-integration.txt${RST}"
 echo -e "  ${GRY}    - deploy-report.html${RST}"
+if [[ "$CLOUD" != "gcp" ]]; then
+  echo -e "  ${GRY}    - ${QI_IMPORT_NAME}${RST}"
+fi
 echo ""
 echo -e "  ${CYN}Opening qlik-network-integration.txt ...${RST}"
 if   command -v xdg-open &>/dev/null; then xdg-open "$QTC_FILE" &
@@ -2816,8 +3016,12 @@ if [[ "$CLOUD" == "gcp" ]]; then
   echo -e "  ${YLW}  Reminder: your tenant must be enrolled in the Google Cloud Private${RST}"
   echo -e "  ${YLW}  Preview before a lakehouse cluster can be created.${RST}"
 else
-  echo -e "  ${GRY}    1. Copy values from qlik-network-integration.txt into QTC${RST}"
-  echo -e "  ${GRY}    2. Create Network Integration in Qlik Talend Cloud${RST}"
+  echo -e "  ${GRY}    1. In QTC: Administration > Lakehouse clusters > Network integrations >${RST}"
+  echo -e "  ${GRY}       Create network integration > Import configuration > ${QI_IMPORT_NAME}${RST}"
+  echo -e "  ${GRY}    2. Check each section against qlik-network-integration.txt, then Confirm${RST}"
+  if [[ -z "$QTC_SPACE_ID" ]]; then
+    echo -e "  ${YLW}       ${QTC_SPACE_BLANK_MSG}${RST}"
+  fi
   echo -e "  ${GRY}    3. Configure Lakehouse Cluster + Glue catalog connection${RST}"
 fi
 echo ""

@@ -42,8 +42,15 @@ same policy. `verify` normalises this before comparing.
 
 ## Import fills the form but Confirm stays disabled
 
-The footer counts required fields left. Common misses: Space (the JSON needs a
-space **id**), an AZ row with no subnet, a VPC ID that does not start with `vpc-`.
+The footer counts required fields left. Common misses: an AZ row with no subnet,
+a VPC ID that does not start with `vpc-`, or a **duplicate integration name**
+("Network integration name is already in use").
+
+## Import lands in the wrong space
+
+A blank `spaceId` is accepted silently and both spaces become
+**Default_Data_Space** with Confirm enabled. Check both Space fields before
+Confirm, or always emit a real space id.
 
 ## Typing into the form via browser automation
 
@@ -52,6 +59,12 @@ shortcuts can be typed as literal characters; triple-click then Delete clears
 it reliably. The Availability Zone options carry no accessible text (they are
 `a`–`f` in order) and stale option refs from an earlier dropdown can linger —
 click by position after a screenshot.
+
+To import without the native file picker, don't click *Import configuration*:
+the list page carries a hidden `<input type="file" accept=".json">`; upload the
+JSON straight to it and the form opens pre-filled. The Lakehouse clusters pages
+can take 20–30 s to render, and a tab can hang while loading; a fresh tab
+recovers.
 
 ## AWS MCP connector sandbox quirks (aws___run_script)
 

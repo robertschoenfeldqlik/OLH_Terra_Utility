@@ -78,6 +78,14 @@ $script:State = @{
     NodeRoleArn        = ""
     S3GatewayEndpoint  = ""
 
+    # ── Qlik Cloud "Create AWS network integration" form (AWS) ──
+    # Written to <name>_AWS_import.json for the form's Import configuration.
+    # A blank space ID is emitted as "" (see $script:QlikBlankSpaceNote).
+    QlikIntegrationName = ""
+    QlikSpaceId         = ""
+    QlikClusterName     = ""
+    QlikImportJsonPath  = ""
+
     # ── Google Cloud ──
     GcpAuthMethod    = "current"          # current | login | keyfile
     GcpKeyFile       = ""
@@ -1767,12 +1775,12 @@ function Build-Step3 {
     $p = New-Object System.Windows.Forms.Panel
     $p.Dock = 'Fill'
 
-    $p.Controls.Add((New-Label "Security, Identity and Tenant Binding" 20 5 720 26 -Bold -FontSize 11))
+    $p.Controls.Add((New-Label "Security, Identity and Tenant Binding" 20 4 720 24 -Bold -FontSize 11))
 
     # ── KMS ──
-    $p.Controls.Add((New-Label "KMS Symmetric Key" 20 34 300 22 -Bold))
+    $p.Controls.Add((New-Label "KMS Symmetric Key" 20 30 300 18 -Bold))
 
-    $cboKms = New-ComboBox "cboKms" 20 58 480
+    $cboKms = New-ComboBox "cboKms" 20 49 480
     $cboKms.Add_SelectedIndexChanged({
         if ($this.SelectedIndex -ge 0 -and $script:State.KmsList.Count -gt $this.SelectedIndex) {
             $sel = $script:State.KmsList[$this.SelectedIndex]
@@ -1781,7 +1789,7 @@ function Build-Step3 {
     })
     $p.Controls.Add($cboKms)
 
-    $btnRefKms = New-Btn "Refresh" 510 57 80 26 {
+    $btnRefKms = New-Btn "Refresh" 510 48 80 26 {
         Write-LogGray "  Discovering KMS keys..."
         $raw = Invoke-AwsCmd "aws kms list-aliases --region $($script:State.Region) --query `"Aliases[?contains(AliasName,'$($script:State.Prefix)')].{Alias:AliasName,KeyId:TargetKeyId}`" --output json" -AsJson -Silent
         $cbo = $script:Controls['cboKms']
@@ -1798,7 +1806,7 @@ function Build-Step3 {
     $p.Controls.Add($btnRefKms)
 
     $chkNewKms = New-Object System.Windows.Forms.CheckBox
-    $chkNewKms.Text = "Create New"; $chkNewKms.Location = [System.Drawing.Point]::new(600, 60); $chkNewKms.Size = [System.Drawing.Size]::new(110, 22)
+    $chkNewKms.Text = "Create New"; $chkNewKms.Location = [System.Drawing.Point]::new(600, 51); $chkNewKms.Size = [System.Drawing.Size]::new(110, 22)
     $chkNewKms.Add_CheckedChanged({
         $script:State.CreateNewKms = $this.Checked
         $script:Controls['cboKms'].Enabled = -not $this.Checked
@@ -1806,45 +1814,101 @@ function Build-Step3 {
     $p.Controls.Add($chkNewKms)
 
     # ── IAM roles ──
-    $p.Controls.Add((New-Sep 20 94 720))
-    $p.Controls.Add((New-Label "IAM Roles" 20 104 300 22 -Bold))
+    $p.Controls.Add((New-Sep 20 78 720))
+    $p.Controls.Add((New-Label "IAM Roles" 20 82 300 18 -Bold))
 
-    $lblRoles = New-Label "Two roles are created. The management role is assumed by Qlik from outside your account and carries the ExternalId condition below; the node role is assumed by EC2, goes into the instance profile, and gets the S3/Kinesis/KMS/Glue policy from Terraform." 20 126 720 44
+    $lblRoles = New-Label "Two roles are created. The management role is assumed by Qlik from outside your account and carries the ExternalId condition below; the node role is assumed by EC2, goes into the instance profile, and gets the S3/Kinesis/KMS/Glue policy from Terraform." 20 100 720 28
     $lblRoles.ForeColor = [System.Drawing.Color]::Gray
     $lblRoles.Font = New-Object System.Drawing.Font("Segoe UI", 8)
     $p.Controls.Add($lblRoles)
 
-    $lblRoleNames = New-Label "" 20 172 720 22
+    $lblRoleNames = New-Label "" 20 128 720 16
+    $lblRoleNames.AutoEllipsis = $true
     $lblRoleNames.ForeColor = [System.Drawing.Color]::FromArgb(25, 66, 104)
     $lblRoleNames.Font = New-Object System.Drawing.Font("Consolas", 8.5)
     $script:Controls['lblRoleNames'] = $lblRoleNames
     $p.Controls.Add($lblRoleNames)
 
     # ── QTC tenant binding ──
-    $p.Controls.Add((New-Sep 20 200 720))
-    $p.Controls.Add((New-Label "Qlik Talend Cloud tenant binding" 20 210 320 22 -Bold))
+    $p.Controls.Add((New-Sep 20 148 720))
+    $p.Controls.Add((New-Label "Qlik Talend Cloud tenant binding" 20 152 320 18 -Bold))
 
-    $lblBind = New-Label "Both values come from Administration > Network integrations in QTC, on the screen where you create the integration." 20 232 720
+    $lblBind = New-Label "Both values come from Administration > Network integrations in QTC, on the screen where you create the integration." 20 170 720 16
     $lblBind.ForeColor = [System.Drawing.Color]::Gray
     $lblBind.Font = New-Object System.Drawing.Font("Segoe UI", 8)
     $p.Controls.Add($lblBind)
 
-    $p.Controls.Add((New-Label "ExternalId" 20 260 110))
-    $p.Controls.Add((New-TextBox "txtQtcExternalId" 135 258 300))
+    $p.Controls.Add((New-Label "ExternalId" 20 190 110))
+    $p.Controls.Add((New-TextBox "txtQtcExternalId" 135 188 300))
 
-    $p.Controls.Add((New-Label "Qlik proxy role ARN" 20 292 130))
-    $p.Controls.Add((New-TextBox "txtQlikProxyArn" 160 290 560 "arn:aws:iam::000000000000:role/qlik-proxy-assume-role"))
+    $p.Controls.Add((New-Label "Qlik proxy role ARN" 20 216 130))
+    $p.Controls.Add((New-TextBox "txtQlikProxyArn" 160 214 560 "arn:aws:iam::000000000000:role/qlik-proxy-assume-role"))
 
-    $lblWhy = New-Label "Without these, the management role has no trust policy Qlik can use and the network integration will never connect." 20 320 720 32
+    $lblWhy = New-Label "Without these, the management role has no trust policy Qlik can use and the network integration will never connect." 20 239 720 16
     $lblWhy.ForeColor = [System.Drawing.Color]::FromArgb(180,130,0)
     $lblWhy.Font = New-Object System.Drawing.Font("Segoe UI", 8)
     $p.Controls.Add($lblWhy)
+
+    # ── Qlik Cloud network integration form ──
+    # These three go into <name>_AWS_import.json, which the form's Import
+    # configuration button loads. Defaults follow the prefix (see VisibleChanged).
+    $p.Controls.Add((New-Sep 20 259 720))
+    $p.Controls.Add((New-Label "Qlik Cloud network integration form" 20 263 320 18 -Bold))
+
+    $p.Controls.Add((New-Label "Integration name" 20 285 110))
+    $p.Controls.Add((New-TextBox "txtQlikIntegrationName" 135 283 230))
+
+    $p.Controls.Add((New-Label "Cluster name" 380 285 90))
+    $p.Controls.Add((New-TextBox "txtQlikClusterName" 475 283 245))
+
+    $lblUnique = New-Label 'Integration name must be unique in the tenant: a name in use shows "Network integration name is already in use" and blocks Confirm.' 20 307 720 16
+    $lblUnique.ForeColor = [System.Drawing.Color]::Gray
+    $lblUnique.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lblUnique)
+
+    $p.Controls.Add((New-Label "Qlik space ID" 20 328 110))
+    $txtSpace = New-TextBox "txtQlikSpaceId" 135 326 230
+    $p.Controls.Add($txtSpace)
+
+    $lblSpaceHint = New-Label "Optional. GET https://<tenant>/api/v1/spaces?name=<space name> in a browser signed in to the tenant returns it." 375 323 345 28
+    $lblSpaceHint.ForeColor = [System.Drawing.Color]::Gray
+    $lblSpaceHint.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lblSpaceHint)
+
+    # Shown only while the space ID is blank: an import with spaceId "" does not
+    # prompt for a space, it silently picks Default_Data_Space for both.
+    $lblSpaceBlank = New-Label $script:QlikBlankSpaceNote 20 352 720 16
+    $lblSpaceBlank.ForeColor = [System.Drawing.Color]::FromArgb(180,130,0)
+    $lblSpaceBlank.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $script:Controls['lblQlikSpaceBlank'] = $lblSpaceBlank
+    $p.Controls.Add($lblSpaceBlank)
+
+    $txtSpace.Add_TextChanged({
+        $script:Controls['lblQlikSpaceBlank'].Visible = -not $this.Text.Trim()
+    })
 
     $p.Add_VisibleChanged({
         if ($this.Visible -and $script:Controls['lblRoleNames']) {
             $pfx = $script:State.Prefix
             $script:Controls['lblRoleNames'].Text =
-                "management: $pfx-mgmt-role-iam    node: $pfx-ec2-role-iam    profile: $pfx-instance-profile"
+                "management: $pfx-mgmt-role-iam  node: $pfx-ec2-role-iam  profile: $pfx-instance-profile"
+
+            # Name defaults follow the prefix until the user types their own.
+            # Tag remembers the default last written, so an untouched box is
+            # recognised (and refreshed) after the prefix changes in step 1.
+            if ($pfx) {
+                $defaults = [ordered]@{
+                    txtQlikIntegrationName = $pfx
+                    txtQlikClusterName     = "$pfx-cluster"
+                }
+                foreach ($k in $defaults.Keys) {
+                    $ctl = $script:Controls[$k]
+                    if ($ctl -and (-not $ctl.Text -or $ctl.Text -eq [string]$ctl.Tag)) {
+                        $ctl.Text = $defaults[$k]
+                        $ctl.Tag  = $defaults[$k]
+                    }
+                }
+            }
         }
     })
 
@@ -2553,7 +2617,7 @@ function Build-Step5 {
     $rtbSum = New-Object System.Windows.Forms.RichTextBox
     $rtbSum.Name     = "rtbSummary"
     $rtbSum.Location = [System.Drawing.Point]::new(20, 35)
-    $rtbSum.Size     = [System.Drawing.Size]::new(500, 270)
+    $rtbSum.Size     = [System.Drawing.Size]::new(500, 240)
     $rtbSum.ReadOnly = $true
     $rtbSum.Font     = New-Object System.Drawing.Font("Consolas", 8.5)
     $rtbSum.BackColor = [System.Drawing.Color]::FromArgb(248, 253, 249)
@@ -2625,6 +2689,16 @@ function Build-Step5 {
     $script:Controls['btnOpenQtc'] = $btnQtc
     $p.Controls.Add($btnQtc)
 
+    # Qlik import JSON (AWS only): shows the file in Explorer, ready to pick in
+    # the form's Import configuration dialog. Deploy-Complete decides visibility.
+    $btnImport = New-Btn "Import JSON" 410 280 110 28 {
+        $ij = $script:State.QlikImportJsonPath
+        if ($ij -and (Test-Path -LiteralPath $ij)) { Start-Process "explorer.exe" -ArgumentList "/select,`"$ij`"" }
+    }
+    $btnImport.Visible = $false
+    $script:Controls['btnOpenImport'] = $btnImport
+    $p.Controls.Add($btnImport)
+
     # Progress Bar
     $prg = New-Object System.Windows.Forms.ProgressBar
     $prg.Name = "prgDeploy"; $prg.Location = [System.Drawing.Point]::new(20, 320)
@@ -2689,6 +2763,11 @@ $subLines
   Instance Profile: $($s.Prefix)-instance-profile
   Qlik proxy:       $($s.QlikProxyRoleArn)
   QTC ExternalId:   $(if ($s.QtcExternalId) { "set" } else { "NOT SET" })
+
+  --- Qlik network integration form ---
+  Integration name: $($s.QlikIntegrationName)
+  Space ID:         $(if ($s.QlikSpaceId) { $s.QlikSpaceId } else { "NOT SET (form defaults to Default_Data_Space)" })
+  Cluster name:     $($s.QlikClusterName)
 
   --- Storage ---
   S3 Iceberg:     $($script:Controls['txtS3Iceberg'].Text)
@@ -2800,6 +2879,266 @@ function Invoke-TerraformFlow {
         Write-LogRed "  X  terraform apply failed (exit $($r3.Code))"
         if ($r3.Err) { Write-LogRed ("  " + (($r3.Err.Trim() -split "`n" | Select-Object -First 8) -join "`n  ")) }
     }
+}
+
+# ── Qlik Cloud "Create AWS network integration" outputs ──
+#
+# Section order, field labels and import-JSON keys were read off the live form
+# and its own "Export form" file on 2026-10-22. The form has no field for
+# Kinesis, the ExternalId, Glue, SSM, the node role or the iceberg/landing/
+# tfstate buckets; those appear only under "also created" in the txt and html.
+# Only confirmed enum values are emitted: CDC workloads = "database",
+# Early rollout = "early-rollout".
+
+# A blank spaceId does not make the form ask for a space: it silently fills
+# both the integration space and the cluster space with Default_Data_Space,
+# marks every section Complete and enables Confirm.
+$script:QlikBlankSpaceNote = "Space not set - the form will default to Default_Data_Space for both the integration and the cluster; change both before pressing Confirm."
+$script:QlikNameInUseNote  = 'The integration name must be unique in the tenant: a name already in use shows "Network integration name is already in use" and Confirm stays disabled.'
+
+function Get-QlikAzLetter {
+    # The form's Availability Zone field holds only the zone letter ("a").
+    param([string]$Az, [string]$Region)
+    if ($Region -and $Az.Length -gt $Region.Length -and $Az.StartsWith($Region)) { return $Az.Substring($Region.Length) }
+    if ($Az -match '\d([a-z]+)$') { return $Matches[1] }
+    return $Az
+}
+
+function New-QlikAwsImport {
+    # Same keys, in the same order, as the form's Export form file.
+    param([System.Collections.IDictionary]$Ni)
+    # @() keeps a single subnet / security group / tag an array in the JSON.
+    $subnets = @(foreach ($pair in $Ni.Subnets) {
+        [ordered]@{
+            availabilityZone = [string](Get-QlikAzLetter $pair.AZ $Ni.Region)
+            subnet           = [string]$pair.Subnet
+        }
+    })
+    return [ordered]@{
+        providerType           = "aws"
+        networkIntegrationName = [string]$Ni.IntegrationName
+        spaceId                = [string]$Ni.SpaceId
+        awsAccount             = [string]$Ni.AccountId
+        symmetricKmsKey        = [string]$Ni.KmsKeyArn
+        bucketName             = [string]$Ni.ConfigBucket
+        defaultManagementRole  = [string]$Ni.MgmtRoleArn
+        defaultDataAccessRole  = [string]$Ni.InstanceProfileArn
+        region                 = [string]$Ni.Region
+        vpcId                  = [string]$Ni.VpcId
+        keyPairName            = $null
+        useProxy               = $false
+        clusterName            = [string]$Ni.ClusterName
+        clusterSpaceId         = [string]$Ni.SpaceId
+        clusterCapabilities    = "database"
+        useCustomImage         = $false
+        rolloutPhaseType       = "early-rollout"
+        subnetIds              = $subnets
+        securityGroupIds       = @([ordered]@{ securityGroupId = [string]$Ni.SgId })
+        tags                   = @(
+            [ordered]@{ key = "Name";     value = [string]$Ni.ClusterName }
+            [ordered]@{ key = "Workload"; value = [string]$Ni.Prefix }
+        )
+    }
+}
+
+function ConvertTo-QlikAwsImportJson {
+    param([System.Collections.IDictionary]$Ni)
+    # -InputObject, not the pipeline, so nothing is unrolled.
+    return (ConvertTo-Json -InputObject (New-QlikAwsImport $Ni) -Depth 6)
+}
+
+function Write-Utf8NoBom {
+    # Set-Content -Encoding UTF8 on PowerShell 5.1 always writes a BOM, which
+    # the browser-side import may reject.
+    param([string]$Path, [string]$Text)
+    [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding $false))
+}
+
+function Format-QlikAwsIntegrationText {
+    param([System.Collections.IDictionary]$Ni)
+    $eq64  = "=" * 64
+    $sep64 = "-" * 64
+    $pad   = " " * 38      # aligns continuation lines under the value column
+    # Word-wraps a note to the value column so Notepad shows it without scrolling.
+    $wrap = {
+        param([string]$Text, [string]$Indent = $pad)
+        $lines = @(); $cur = ""
+        foreach ($w in ($Text -split ' ')) {
+            if ($cur -and ($cur.Length + 1 + $w.Length) -gt 76) { $lines += $cur; $cur = $w }
+            elseif ($cur) { $cur += " $w" } else { $cur = $w }
+        }
+        if ($cur) { $lines += $cur }
+        $lines -join "`n$Indent"
+    }
+    $space = if ($Ni.SpaceId) { $Ni.SpaceId } else { "(not set)" }
+    $spaceNote = if ($Ni.SpaceId) { "" } else { "`n$pad" + (& $wrap $script:QlikBlankSpaceNote) }
+
+    $azRows = @(foreach ($pair in $Ni.Subnets) {
+        "{0,-3} {1}" -f (Get-QlikAzLetter $pair.AZ $Ni.Region), $pair.Subnet
+    })
+    $azBlock = if ($azRows.Count) { $azRows -join "`n$pad" } else { "(none)" }
+
+    $tagBlock     = "Name = $($Ni.ClusterName)`n${pad}Workload = $($Ni.Prefix)"
+    $appliedBlock = (@($Ni.AppliedTags.Keys | ForEach-Object { "$_ = $($Ni.AppliedTags[$_])" })) -join "`n$pad"
+    $dryNote = if ($Ni.DryRun) { "`n  DRY-RUN    : IDs containing DRYRUN are placeholders - do not import this file." } else { "" }
+    $importSpaceNote = if ($Ni.SpaceId) { "" } else { "`n  !! " + (& $wrap $script:QlikBlankSpaceNote "     ") }
+
+    return @"
+$eq64
+  Qlik Open Lakehouse -- Create AWS network integration
+  Generated  : $($Ni.Generated)
+  Prefix     : $($Ni.Prefix)
+  Mode       : $($Ni.Mode)$dryNote
+$eq64
+
+  IMPORT FILE
+  $($Ni.ImportJsonPath)
+  In Qlik Cloud: Administration > Lakehouse clusters > Network integrations >
+  Create network integration > Import configuration, then choose this file.
+  It fills the form below; check each section against these values.$importSpaceNote
+
+$sep64
+  Details
+$sep64
+  Network integration name          : $($Ni.IntegrationName)
+$pad$(& $wrap $script:QlikNameInUseNote)
+  Integration space                 : $space$spaceNote
+
+$sep64
+  1. Grant Qlik access to your cloud
+$sep64
+  AWS account                       : $($Ni.AccountId)
+  Symmetric KMS key ARN             : $($Ni.KmsKeyArn)
+  S3 bucket for internal Qlik files : $($Ni.ConfigBucket)
+  Management role                   : $($Ni.MgmtRoleArn)
+  EC2 instances profile             : $($Ni.InstanceProfileArn)
+
+$sep64
+  2. Connect Qlik to your network
+$sep64
+  Region                            : $($Ni.Region)
+  VPC ID                            : $($Ni.VpcId)
+  Availability Zone / Subnet        : $azBlock
+  Security groups                   : $($Ni.SgId)
+  EC2 key pair name                 : None
+  Advanced settings
+    Use a proxy server              : Off
+
+$sep64
+  3. Create a lakehouse cluster
+$sep64
+  Cluster name                      : $($Ni.ClusterName)
+  Space                             : $space$spaceNote
+  Cluster capabilities              : CDC workloads
+  Tags                              : $tagBlock
+  Custom image                      : Off
+  Rollout phase                     : Early rollout
+
+$sep64
+  ALSO CREATED (not asked for by the form)
+$sep64
+  Node role ARN                     : $($Ni.NodeRoleArn)
+  S3 Iceberg bucket                 : $($Ni.IcebergBucket)
+  S3 Landing bucket                 : $($Ni.LandingBucket)
+  Terraform state bucket            : $($Ni.TfStateBucket)
+  Kinesis stream                    : $($Ni.KinesisName)
+  S3 gateway VPC endpoint           : $(if ($Ni.S3GatewayEndpoint) { $Ni.S3GatewayEndpoint } else { "created by Terraform" })
+  Glue database                     : $($Ni.GlueDatabase)
+  SSM path                          : $($Ni.SsmPath)
+  Applied tags                      : $appliedBlock
+$sep64
+"@
+}
+
+function Format-QlikAwsReportHtml {
+    param([System.Collections.IDictionary]$Ni)
+    function Local:HtmlEnc([string]$v) { [System.Net.WebUtility]::HtmlEncode($v) }
+    function Local:HtmlRow([string]$k, [string]$v) { "  <div class=`"k`">$(HtmlEnc $k)</div><div class=`"v`">$(HtmlEnc $v)</div>" }
+
+    $space = if ($Ni.SpaceId) { $Ni.SpaceId } else { $script:QlikBlankSpaceNote }
+    $azRows = @()
+    $first = $true
+    foreach ($pair in $Ni.Subnets) {
+        $azRows += HtmlRow $(if ($first) { "Availability Zone / Subnet" } else { "" }) ("{0}   {1}" -f (Get-QlikAzLetter $pair.AZ $Ni.Region), $pair.Subnet)
+        $first = $false
+    }
+    if (-not $azRows.Count) { $azRows += HtmlRow "Availability Zone / Subnet" "(none)" }
+    $tagSpans = @($Ni.AppliedTags.Keys | ForEach-Object { "  <span class=`"tag`">$(HtmlEnc "${_}: $($Ni.AppliedTags[$_])")</span>" })
+    $spaceStatus = if ($Ni.SpaceId) { "" } else { "`n" + (HtmlRow "Space" $script:QlikBlankSpaceNote) }
+
+    return @"
+<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>Qlik OLH Deploy Report - $(HtmlEnc $Ni.Prefix)</title>
+<style>
+body{font-family:Segoe UI,sans-serif;background:#f5f7f5;color:#1f2328;padding:24px;max-width:900px;margin:auto}
+h1{color:#fff;background:#194268;padding:14px 20px;border-radius:8px;margin-bottom:16px;font-size:18px}
+h1 small{font-size:12px;opacity:.8;display:block;margin-top:4px}
+.section{background:#fff;border:1px solid #c8d6c8;border-radius:7px;margin-bottom:12px;overflow:hidden}
+.section h2{background:#e8f5ed;padding:8px 16px;font-size:13px;color:#009845;margin:0;border-bottom:1px solid #c8d6c8}
+.grid{display:grid;grid-template-columns:200px 1fr;font-size:12px}
+.k{padding:5px 16px;color:#54565a;background:#fafbfa;border-bottom:1px solid #e8f5ed}
+.v{padding:5px 16px;font-family:monospace;border-bottom:1px solid #e8f5ed;word-break:break-all}
+.tags{display:flex;flex-wrap:wrap;gap:5px;padding:10px 16px}
+.tag{background:#e8f5ed;color:#156037;border:1px solid #009845;padding:2px 9px;border-radius:10px;font-size:11px}
+.chips{display:flex;gap:8px;padding:10px 16px;flex-wrap:wrap}
+.chip{padding:3px 12px;border-radius:10px;font-size:12px;font-weight:600}
+.ok{background:#dafbe1;color:#116329}
+.warn{background:#fff8c5;color:#9a6700}
+</style></head><body>
+<h1>Qlik Open Lakehouse -- Deployment Report
+  <small>Prefix: $(HtmlEnc $Ni.Prefix) | Region: $(HtmlEnc $Ni.Region) | $(HtmlEnc $Ni.Generated)</small>
+</h1>
+<div class="section"><h2>Status</h2><div class="chips">
+  <span class="chip warn">Prerequisites Provisioned - Terraform Pending</span>
+  <span class="chip $(if ($Ni.AllCompliant) { 'ok' } else { 'warn' })">$(if ($Ni.AllCompliant) { 'Tags Compliant' } else { 'Tags Incomplete' })</span>
+  <span class="chip $(if ($Ni.DryRun) { 'warn' } else { 'ok' })">$(if ($Ni.DryRun) { 'Dry-Run Mode' } else { 'Live Mode' })</span>
+</div><div class="grid">
+$(HtmlRow "Import file" $Ni.ImportJsonPath)
+$(HtmlRow "Load it at" "Administration > Lakehouse clusters > Network integrations > Create network integration > Import configuration")$spaceStatus
+</div></div>
+<div class="section"><h2>Details</h2><div class="grid">
+$(HtmlRow "Network integration name" $Ni.IntegrationName)
+$(HtmlRow "" $script:QlikNameInUseNote)
+$(HtmlRow "Integration space" $space)
+</div></div>
+<div class="section"><h2>1. Grant Qlik access to your cloud</h2><div class="grid">
+$(HtmlRow "AWS account" $Ni.AccountId)
+$(HtmlRow "Symmetric KMS key ARN" $Ni.KmsKeyArn)
+$(HtmlRow "S3 bucket for internal Qlik files" $Ni.ConfigBucket)
+$(HtmlRow "Management role" $Ni.MgmtRoleArn)
+$(HtmlRow "EC2 instances profile" $Ni.InstanceProfileArn)
+</div></div>
+<div class="section"><h2>2. Connect Qlik to your network</h2><div class="grid">
+$(HtmlRow "Region" $Ni.Region)
+$(HtmlRow "VPC ID" $Ni.VpcId)
+$($azRows -join "`n")
+$(HtmlRow "Security groups" $Ni.SgId)
+$(HtmlRow "EC2 key pair name" "None")
+$(HtmlRow "Use a proxy server" "Off")
+</div></div>
+<div class="section"><h2>3. Create a lakehouse cluster</h2><div class="grid">
+$(HtmlRow "Cluster name" $Ni.ClusterName)
+$(HtmlRow "Space" $space)
+$(HtmlRow "Cluster capabilities" "CDC workloads")
+$(HtmlRow "Tags" "Name = $($Ni.ClusterName)")
+$(HtmlRow "" "Workload = $($Ni.Prefix)")
+$(HtmlRow "Custom image" "Off")
+$(HtmlRow "Rollout phase" "Early rollout")
+</div></div>
+<div class="section"><h2>Also created</h2><div class="grid">
+$(HtmlRow "Node role ARN" $Ni.NodeRoleArn)
+$(HtmlRow "S3 Iceberg bucket" $Ni.IcebergBucket)
+$(HtmlRow "S3 Landing bucket" $Ni.LandingBucket)
+$(HtmlRow "Terraform state bucket" $Ni.TfStateBucket)
+$(HtmlRow "Kinesis stream" $Ni.KinesisName)
+$(HtmlRow "S3 gateway VPC endpoint" $(if ($Ni.S3GatewayEndpoint) { $Ni.S3GatewayEndpoint } else { "created by Terraform" }))
+$(HtmlRow "Glue database" $Ni.GlueDatabase)
+$(HtmlRow "SSM path" $Ni.SsmPath)
+</div><div class="tags">
+$($tagSpans -join "`n")
+</div></div>
+</body></html>
+"@
 }
 
 function Start-Deploy {
@@ -3327,10 +3666,6 @@ function Start-Deploy {
     $step++; Update-Progress ([int]($step/$totalSteps*100)) "Writing output files..."
     Write-Log "`n  -- Output Files --" -Bold $true
 
-    $subnetBlock = ($subnetAzPairs | ForEach-Object {
-        "    Subnet: $($_.Subnet)   AZ: $($_.AZ)"
-    }) -join "`n"
-
     $modeComment = if ($DryRun) { "DRY-RUN" } else { "LIVE" }
     $tfDir = Get-TerraformDir
     if (-not (Test-Path -LiteralPath $tfDir)) { New-Item -ItemType Directory -Path $tfDir -Force | Out-Null }
@@ -3378,127 +3713,65 @@ tag_createdate = "$($s.CreateDate)"
 "@ | Set-Content -Path $tfvarsPath -Encoding UTF8
     Write-LogGreen "  OK  terraform.tfvars"
 
-    # QTC Reference file
+    # Qlik Cloud form outputs: the import JSON for Import configuration, plus the
+    # same values as a text reference and an HTML report, in the form's order.
+    $niName    = if ($s.QlikIntegrationName) { $s.QlikIntegrationName } else { $PREFIX }
+    $niCluster = if ($s.QlikClusterName)     { $s.QlikClusterName }     else { "$PREFIX-cluster" }
+    $importName = "${niName}_AWS_import.json"
+    $importFile = Join-Path $script:ScriptDir $importName
+    $ni = [ordered]@{
+        Prefix             = $PREFIX
+        Mode               = $modeComment
+        DryRun             = $DryRun
+        Generated          = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        ImportJsonPath     = $importFile
+        AllCompliant       = $allCompliant
+        # Details
+        IntegrationName    = $niName
+        SpaceId            = $s.QlikSpaceId
+        # 1. Grant Qlik access to your cloud
+        AccountId          = $acctId
+        KmsKeyArn          = $KMS_KEY_ARN
+        ConfigBucket       = $S3_CONFIG
+        MgmtRoleArn        = $MGMT_ROLE_ARN
+        InstanceProfileArn = $INSTANCE_PROFILE_ARN
+        # 2. Connect Qlik to your network
+        Region             = $s.Region
+        VpcId              = $VPC_ID
+        Subnets            = @($subnetAzPairs)
+        SgId               = $SG_ID
+        # 3. Create a lakehouse cluster
+        ClusterName        = $niCluster
+        # Also created (no field in the form)
+        NodeRoleArn        = $NODE_ROLE_ARN
+        IcebergBucket      = $S3_ICEBERG
+        LandingBucket      = $S3_LANDING
+        TfStateBucket      = $TFSTATE_BUCKET
+        KinesisName        = $KINESIS_NAME
+        S3GatewayEndpoint  = $S3_VPCE_ID
+        GlueDatabase       = "$($s.Initials)_$($s.Workload)_$($s.Environment)_db_glue"
+        SsmPath            = "/$($s.Initials)/$($s.Workload)/$($s.Environment)"
+        AppliedTags        = $requiredTags
+    }
+
+    $s.QlikImportJsonPath = ""
+    try {
+        Write-Utf8NoBom -Path $importFile -Text (ConvertTo-QlikAwsImportJson $ni)
+        $s.QlikImportJsonPath = $importFile
+        Write-LogGreen "  OK  $importName"
+        Write-LogGray  "      $importFile"
+        Write-LogGray  "      Qlik Cloud: Administration > Lakehouse clusters > Network integrations > Create network integration > Import configuration"
+    } catch {
+        Write-LogRed "  X   Could not write ${importName}: $($_.Exception.Message)"
+    }
+    if (-not $s.QlikSpaceId) { Write-LogYellow "  !!  $($script:QlikBlankSpaceNote)" }
+
     $qtcFile = Join-Path $script:ScriptDir "qlik-network-integration.txt"
-    $sep55 = "-" * 55
-    $eq64  = "=" * 64
-
-    @"
-$eq64
-  Qlik Open Lakehouse -- QTC Network Integration Reference
-  Generated  : $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-  Prefix     : $PREFIX
-  Mode       : $modeComment
-$eq64
-
-$sep55
-  ENTITY                         VALUE
-$sep55
-  AWS Account ID               : $acctId
-  VPC ID                       : $VPC_ID
-  CIDR Range of VPC            : $VPC_CIDR
-
-  Subnet / Availability Zone pairs:
-$subnetBlock
-
-  Symmetric KMS Key ARN        : $KMS_KEY_ARN
-  S3 Bucket Name               : $S3_ICEBERG
-  Kinesis Stream Name          : $KINESIS_NAME
-  Security Group ID            : $SG_ID
-  S3 Gateway VPC Endpoint      : $(if ($S3_VPCE_ID) { $S3_VPCE_ID } else { "created by Terraform" })
-  Management Role ARN          : $MGMT_ROLE_ARN
-  Node Role ARN                : $NODE_ROLE_ARN
-  Instance Profile ARN         : $INSTANCE_PROFILE_ARN
-$sep55
-
-  APPLIED TAGS
-$sep55
-  Owner         : $($s.Initials)
-  Environment   : $($s.Environment)
-  Workload      : qlik-olh
-  Application   : open-lakehouse
-  CreateDate    : $($s.CreateDate)
-  ManagedBy     : script
-$sep55
-
-  GENERATED RESOURCE NAMES
-$sep55
-  S3 Iceberg    : $S3_ICEBERG
-  S3 Landing    : $S3_LANDING
-  S3 Config     : $S3_CONFIG
-  IAM Role      : $PREFIX-ec2-role-iam
-  Glue Database : $($s.Initials)_$($s.Workload)_$($s.Environment)_db_glue
-  SSM Path      : /$($s.Initials)/$($s.Workload)/$($s.Environment)
-$sep55
-"@ | Set-Content -Path $qtcFile -Encoding UTF8
+    Format-QlikAwsIntegrationText $ni | Set-Content -Path $qtcFile -Encoding UTF8
     Write-LogGreen "  OK  qlik-network-integration.txt"
 
-    # HTML Report
     $rptFile = Join-Path $script:ScriptDir "deploy-report.html"
-    $snHtml = ($subnetAzPairs | ForEach-Object {
-        "<div class='v'>Subnet: $($_.Subnet) / AZ: $($_.AZ)</div>"
-    }) -join ""
-
-    @"
-<!DOCTYPE html><html><head><meta charset="UTF-8">
-<title>Qlik OLH Deploy Report - $PREFIX</title>
-<style>
-body{font-family:Segoe UI,sans-serif;background:#f5f7f5;color:#1f2328;padding:24px;max-width:900px;margin:auto}
-h1{color:#fff;background:#194268;padding:14px 20px;border-radius:8px;margin-bottom:16px;font-size:18px}
-h1 small{font-size:12px;opacity:.8;display:block;margin-top:4px}
-.section{background:#fff;border:1px solid #c8d6c8;border-radius:7px;margin-bottom:12px;overflow:hidden}
-.section h2{background:#e8f5ed;padding:8px 16px;font-size:13px;color:#009845;margin:0;border-bottom:1px solid #c8d6c8}
-.grid{display:grid;grid-template-columns:200px 1fr;font-size:12px}
-.k{padding:5px 16px;color:#54565a;background:#fafbfa;border-bottom:1px solid #e8f5ed}
-.v{padding:5px 16px;font-family:monospace;border-bottom:1px solid #e8f5ed;word-break:break-all}
-.tags{display:flex;flex-wrap:wrap;gap:5px;padding:10px 16px}
-.tag{background:#e8f5ed;color:#156037;border:1px solid #009845;padding:2px 9px;border-radius:10px;font-size:11px}
-.chips{display:flex;gap:8px;padding:10px 16px;flex-wrap:wrap}
-.chip{padding:3px 12px;border-radius:10px;font-size:12px;font-weight:600}
-.ok{background:#dafbe1;color:#116329}
-.warn{background:#fff8c5;color:#9a6700}
-</style></head><body>
-<h1>Qlik Open Lakehouse -- Deployment Report
-  <small>Prefix: $PREFIX | Region: $($s.Region) | $(Get-Date)</small>
-</h1>
-<div class="section"><h2>Status</h2><div class="chips">
-  <span class="chip warn">Prerequisites Provisioned - Terraform Pending</span>
-  <span class="chip $(if ($allCompliant) { 'ok' } else { 'warn' })">$(if ($allCompliant) { 'Tags Compliant' } else { 'Tags Incomplete' })</span>
-  <span class="chip $(if ($DryRun) { 'warn' } else { 'ok' })">$(if ($DryRun) { 'Dry-Run Mode' } else { 'Live Mode' })</span>
-</div></div>
-<div class="section"><h2>Network</h2><div class="grid">
-  <div class="k">VPC ID</div><div class="v">$VPC_ID</div>
-  <div class="k">VPC CIDR</div><div class="v">$VPC_CIDR</div>
-  <div class="k">Security Group</div><div class="v">$SG_ID</div>
-  <div class="k">Subnets / AZs</div>$snHtml
-</div></div>
-<div class="section"><h2>Security and Encryption</h2><div class="grid">
-  <div class="k">KMS Key ARN</div><div class="v">$KMS_KEY_ARN</div>
-  <div class="k">Management Role</div><div class="v">$MGMT_ROLE_ARN</div>
-  <div class="k">Instance Profile</div><div class="v">$INSTANCE_PROFILE_ARN</div>
-</div></div>
-<div class="section"><h2>Storage and Streaming</h2><div class="grid">
-  <div class="k">S3 Iceberg</div><div class="v">$S3_ICEBERG</div>
-  <div class="k">S3 Landing</div><div class="v">$S3_LANDING</div>
-  <div class="k">S3 Config</div><div class="v">$S3_CONFIG</div>
-  <div class="k">Kinesis Stream</div><div class="v">$KINESIS_NAME</div>
-</div></div>
-<div class="section"><h2>Applied Tags</h2><div class="tags">
-  <span class="tag">Owner: $($s.Initials)</span>
-  <span class="tag">Environment: $($s.Environment)</span>
-  <span class="tag">Workload: qlik-olh</span>
-  <span class="tag">Application: open-lakehouse</span>
-  <span class="tag">CreateDate: $($s.CreateDate)</span>
-  <span class="tag">ManagedBy: script</span>
-</div></div>
-<div class="section"><h2>Generated Names</h2><div class="grid">
-  <div class="k">IAM Role</div><div class="v">$PREFIX-ec2-role-iam</div>
-  <div class="k">Glue Database</div><div class="v">$($s.Initials)_$($s.Workload)_$($s.Environment)_db_glue</div>
-  <div class="k">SSM Path</div><div class="v">/$($s.Initials)/$($s.Workload)/$($s.Environment)</div>
-  <div class="k">TF State Bucket</div><div class="v">$TFSTATE_BUCKET</div>
-</div></div>
-</body></html>
-"@ | Set-Content -Path $rptFile -Encoding UTF8
+    Format-QlikAwsReportHtml $ni | Set-Content -Path $rptFile -Encoding UTF8
     Write-LogGreen "  OK  deploy-report.html"
 
     # Step 14: Terraform
@@ -3517,7 +3790,7 @@ h1 small{font-size:12px;opacity:.8;display:block;margin-top:4px}
     Write-LogCyan "`n  ============================================================"
     Write-LogCyan "  Deployment Complete!"
     Write-LogCyan "  ============================================================"
-    Write-LogGreen "  Output files: terraform.tfvars, qlik-network-integration.txt, deploy-report.html"
+    Write-LogGreen "  Output files: terraform.tfvars, $importName, qlik-network-integration.txt, deploy-report.html"
 
     Deploy-Complete
 }
@@ -3530,6 +3803,9 @@ function Deploy-Complete {
     $script:Controls['btnNext'].Enabled = $true
     $script:Controls['btnOpenReport'].Visible = $true
     $script:Controls['btnOpenQtc'].Visible = $true
+    # The import JSON exists on the AWS path only (no GCP form captured yet).
+    $ij = $script:State.QlikImportJsonPath
+    $script:Controls['btnOpenImport'].Visible = ($script:State.Cloud -ne "gcp" -and $ij -and (Test-Path -LiteralPath $ij))
 }
 
 #endregion
@@ -4146,8 +4422,31 @@ function Validate-Step {
                     "Validation", 'OK', 'Warning') | Out-Null
                 return $false
             }
-            $script:State.QtcExternalId    = $ext
-            $script:State.QlikProxyRoleArn = $proxy
+            # Qlik Cloud form values. The name also names the import file.
+            $niName = $script:Controls['txtQlikIntegrationName'].Text.Trim()
+            if (-not $niName -or $niName.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Enter a network integration name.`n`nIt also names the import file (<name>_AWS_import.json), so it cannot contain \ / : * ? `" < > |`n`n$($script:QlikNameInUseNote)",
+                    "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            $clName = $script:Controls['txtQlikClusterName'].Text.Trim()
+            if (-not $clName) {
+                [System.Windows.Forms.MessageBox]::Show("Enter a lakehouse cluster name.", "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
+            $spaceId = $script:Controls['txtQlikSpaceId'].Text.Trim()
+            if ($spaceId -and $spaceId -notmatch '^[0-9a-f]{24}$') {
+                $r = [System.Windows.Forms.MessageBox]::Show(
+                    "'$spaceId' does not look like a Qlik space ID (24 hex characters, e.g. 0123456789abcdef01234567).`n`nThe form wants the space ID, not its name: GET https://<tenant>/api/v1/spaces?name=<space name> returns it.`n`nUse this value anyway?",
+                    "Validation", 'YesNo', 'Warning')
+                if ($r -ne 'Yes') { return $false }
+            }
+            $script:State.QtcExternalId       = $ext
+            $script:State.QlikProxyRoleArn    = $proxy
+            $script:State.QlikIntegrationName = $niName
+            $script:State.QlikClusterName     = $clName
+            $script:State.QlikSpaceId         = $spaceId
             return $true
         }
         4 {

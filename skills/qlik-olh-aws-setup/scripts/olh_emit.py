@@ -23,10 +23,12 @@ import json
 import os
 import sys
 
-# Values confirmed from real "Export form" files. Others exist in the form
-# (Streaming workloads, Later rollout) but their JSON spelling has not been
-# observed - pass them raw with *_raw config keys once confirmed.
-CAPABILITY = {"cdc": "database"}
+# "database" was read from a real Export form file. "streaming" is the value the
+# form's radio button and the lakehouse-clusters API (clusterCapabilities.type)
+# use for Streaming workloads, which is exactly how "database" maps for CDC
+# (verified on a live streaming cluster, 2026-10-22). Later rollout has not been
+# observed - pass it raw with rollout_raw once confirmed.
+CAPABILITY = {"cdc": "database", "streaming": "streaming"}
 ROLLOUT = {"early": "early-rollout"}
 
 
@@ -76,7 +78,7 @@ def build_import(cfg, out):
 
 
 def build_form_md(cfg, imp, space_name):
-    cap = {"database": "CDC workloads"}.get(imp["clusterCapabilities"], imp["clusterCapabilities"])
+    cap = {"database": "CDC workloads", "streaming": "Streaming workloads"}.get(imp["clusterCapabilities"], imp["clusterCapabilities"])
     roll = {"early-rollout": "Early rollout"}.get(imp["rolloutPhaseType"], imp["rolloutPhaseType"])
     az_rows = "\n".join(f"| {s['availabilityZone']} | `{s['subnet']}` |" for s in imp["subnetIds"])
     tag_rows = "\n".join(f"| {t['key']} | {t['value']} |" for t in imp["tags"])

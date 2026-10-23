@@ -23,6 +23,7 @@ race), the references hold what was observed.
 | AWS access | the AWS MCP connector (preferred) or local boto3 credentials |
 | **Trust entity** — Qlik proxy role ARN + `sts:ExternalId` | Qlik form > section 1 > Management role > **Configuration guide**. Users often save it as a `trust entity.txt`; read it, don't retype it |
 | Qlik tenant host, integration space name | the user |
+| **Cluster type — CDC or Streaming?** | always ask; never assume. CDC = database/SaaS change capture, billed by data volume, tasks free. Streaming = streaming ingestion/transformation and Qlik Replicate sources, billed by compute |
 
 Ask once for anything missing. Confirm the AWS account before creating anything:
 call `sts GetCallerIdentity` and say which account (and whether it is root) you
@@ -85,8 +86,9 @@ both to the user. `assets/example-import.json` shows the exact shape.
 
 ### 6. Create the integration in Qlik Cloud
 Administration > Lakehouse clusters > Network integrations > **Create network
-integration** ▾ > **Import configuration** > load the JSON. Check the space,
-then **Confirm**. Confirm launches billable EC2 in the user's account — get a
+integration** ▾ > **Import configuration** > load the JSON. Check both Space
+fields (a missing space id silently becomes Default_Data_Space) and that the
+integration name is unique in the tenant, then **Confirm**. Confirm launches billable EC2 in the user's account — get a
 clear yes for it.
 
 If filling by hand instead, `<name>_form_values.md` has every field.
@@ -106,6 +108,32 @@ it is a running cost.
 
 Call it done only when the user sees Connected and Running in the Qlik UI.
 
+## Adding a cluster to an existing integration
+One integration can carry several clusters — for example a CDC cluster from the
+import plus a Streaming one. This is a different dialog from the integration
+form: Administration > Lakehouse clusters > **Lakehouse clusters** tab >
+**Create new** > *Create lakehouse cluster*.
+
+Ask CDC or Streaming first. Name and tag it by appending the capability to the
+user's naming — e.g. `rgs_olh_mcg_streaming` — and use the same value for the
+`Name` and `Workload` tags. Then fill, smallest by default unless told otherwise:
+
+| Field | Smallest setting | Why |
+|---|---|---|
+| Network integration | the existing one | |
+| Space | the user's space (it defaults to Default_Data_Space) | |
+| Cluster capabilities | CDC workloads / Streaming workloads | as answered |
+| Family type > Type / Size | `r` / `2xlarge` | lists fill only after the integration is picked: Type `r`/`x`, Size `2xlarge` up to `96xlarge`/metal. `r`+`2xlarge` is the smallest; Qlik launched it as r8i-flex.2xlarge Spot |
+| AWS On-Demand Instances | `0` | |
+| AWS Spot Instances Min / Max | `1` / `1` | one instance is the floor for a working cluster |
+| Scaling strategy | Low cost | default is Low latency |
+| Tags | `Name`, `Workload` = the cluster name | |
+
+The Space box is type-to-search: type part of the name, then ArrowDown +
+Enter — clicking the option can leave it empty and keep **Create** disabled.
+Then **Create** and verify as in step 7: the new cluster reaches **Running**
+(about 1–2 minutes), and AWS shows another `qlik_<uuid>` Auto Scaling group.
+
 ## When something fails
 Read `references/troubleshooting.md`. The common one — *"Service-Linked Role for
 this Auto Scaling group is not yet ready"* — is fixed by confirming the role
@@ -113,6 +141,6 @@ exists, then **⋯ > Redeploy** on the integration row.
 
 ## Scope
 AWS only. The GCP Private Preview uses a different form and has not been
-captured. Streaming-workload clusters and Later rollout work, but their import
-values have not been observed; `olh_emit.py` stops and asks for them rather
-than guessing (see the reference).
+captured. In the import JSON, `cluster_capability` takes `cdc` (`"database"`) or
+`streaming` (`"streaming"`); only Early rollout is a confirmed rollout value, and
+`olh_emit.py` stops rather than guessing others (see the reference).
