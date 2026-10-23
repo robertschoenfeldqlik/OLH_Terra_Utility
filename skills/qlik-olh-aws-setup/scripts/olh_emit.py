@@ -49,7 +49,14 @@ def build_import(cfg, out):
 
     space = need("space_id", cfg, "config (resolve it with GET /api/v1/spaces?name=<space name>)")
     prefix = cfg["prefix"]
-    tags = cfg.get("cluster_tags") or {"Name": f"{prefix}-cluster", "Workload": prefix}
+    # CDC keeps the original naming; a Streaming cluster appends "streaming" and
+    # uses its own name for both tags (matches the wizards' defaults).
+    if capability == "streaming":
+        cluster = cfg.get("cluster_name", f"{prefix}-streaming")
+        tags = cfg.get("cluster_tags") or {"Name": cluster, "Workload": cluster}
+    else:
+        cluster = cfg.get("cluster_name", f"{prefix}-cluster")
+        tags = cfg.get("cluster_tags") or {"Name": cluster, "Workload": prefix}
 
     return {
         "providerType": "aws",
@@ -65,7 +72,7 @@ def build_import(cfg, out):
         "vpcId": need("vpc_id", out, "outputs"),
         "keyPairName": cfg.get("key_pair_name"),
         "useProxy": False,
-        "clusterName": cfg.get("cluster_name", f"{prefix}-cluster"),
+        "clusterName": cluster,
         "clusterSpaceId": cfg.get("cluster_space_id", space),
         "clusterCapabilities": capability,
         "useCustomImage": False,

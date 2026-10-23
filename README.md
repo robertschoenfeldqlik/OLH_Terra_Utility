@@ -136,21 +136,66 @@ ExternalId, Glue or SSM field. Its **Export form** / **Import configuration**
 buttons round-trip a JSON file whose schema is documented in
 `skills/qlik-olh-aws-setup/references/qtc-form-and-import.md`.
 
-`skills/qlik-olh-aws-setup/` turns that into a repeatable flow, verified end to
-end against a live account and tenant on 2026-10-22: build the AWS objects
-(through the AWS MCP connector or local boto3), attach the policies the form's
-*Configuration guide* generates, pre-create the Auto Scaling and Spot
-service-linked roles, then emit `<name>_AWS_import.json` plus the form values.
-Install it from `skills/qlik-olh-aws-setup.skill`.
+### What the wizards write (AWS path)
 
-On a fresh account the first deploy fails with *"The Service-Linked Role for
-this Auto Scaling group is not yet ready for use"*: Qlik creates the role and
-uses it in the same breath. The skill creates both roles up front; after the
-fact, **⋯ > Redeploy** on the integration recovers it.
+Both wizards ask for the integration name (must be unique in the tenant), the
+Qlik space ID (optional), **the cluster capability — CDC or Streaming, always
+asked**, and the cluster name, then write:
 
-The wizards' `qlik-network-integration.txt` reference sheet still lists the
-older, broader value set; use the skill's emitted form values for the Qlik
-form itself.
+| File | Use |
+|---|---|
+| `<integration name>_AWS_import.json` | Network integrations > Create network integration > **Import configuration**. Same keys and order as Qlik's own Export form |
+| `qlik-network-integration.txt` | The form's values in its own section order, then what else was created |
+| `deploy-report.html` | The same, as a page |
+
+`clusterCapabilities` is `"database"` for CDC and `"streaming"` for Streaming.
+Default cluster names: `<prefix>-cluster` (CDC), `<prefix>-streaming`
+(Streaming, which also uses that name for its `Workload` tag).
+
+Before **Confirm**:
+- **Attach the role policies.** Each role field on the form has a
+  *Configuration guide* that generates an inline policy from the values entered
+  — one for the management role, one for the EC2 instance profile's role. The
+  wizards don't attach them; the skill does.
+- **Check both Space fields.** A blank space ID imports silently as
+  *Default_Data_Space* for the integration and the cluster.
+- **Pre-create the service-linked roles** on a fresh account (below).
+
+### Fresh accounts: the service-linked role race
+
+The first deploy fails with *"The Service-Linked Role for this Auto Scaling
+group is not yet ready for use"*: Qlik creates `AWSServiceRoleForAutoScaling`
+and uses it in the same breath. Create it — and `AWSServiceRoleForEC2Spot` —
+before Confirm:
+
+```bash
+aws iam create-service-linked-role --aws-service-name autoscaling.amazonaws.com
+```
+
+```bash
+aws iam create-service-linked-role --aws-service-name spot.amazonaws.com
+```
+
+After the fact, **⋯ > Redeploy** on the integration row recovers it.
+
+### Adding a cluster — e.g. Streaming
+
+One integration can carry several clusters. Lakehouse clusters tab >
+**Create new** opens a separate dialog that, unlike the integration form,
+exposes sizing; its Type/Size lists fill only after the integration is picked.
+Smallest working setting: Type `r`, Size `2xlarge`, On-Demand `0`, Spot
+min/max `1`/`1`, scaling **Low cost**. Verified live: a Streaming cluster on
+those settings ran as one r8i-flex.2xlarge Spot instance and reached Running in
+about a minute.
+
+### The skill
+
+`skills/qlik-olh-aws-setup/` turns all of this into a repeatable flow, verified
+end to end against a live account and tenant on 2026-10-22: build the AWS
+objects (through the AWS MCP connector or local boto3), attach the generated
+policies, pre-create both service-linked roles, ask CDC or Streaming, then emit
+the import JSON plus the form values. Install it from
+`skills/qlik-olh-aws-setup.skill`.
 
 ## Service mapping
 
@@ -217,8 +262,9 @@ them.
 ## Documentation
 
 `Qlik-OLH-Deployment-Instructions.docx` has the full step-by-step guide, inputs
-reference, output-file descriptions, the Terraform flow, and a troubleshooting
-table. Open it in Word for the branded version.
+reference, output-file descriptions, creating the network integration and
+clusters (CDC or Streaming) in Qlik Cloud, the Terraform flow, and a
+troubleshooting table. Open it in Word for the branded version.
 
 ## License
 

@@ -1649,10 +1649,32 @@ if ! $DRIFT_ONLY && ! $TEARDOWN; then
     "Letters and digits only, e.g. 0123456789abcdef01234567 - or leave blank."
   QTC_SPACE_ID="$REPLY"
 
-  prompt_val "Cluster name" "${PREFIX}-cluster" "^[A-Za-z0-9][A-Za-z0-9._-]*$" \
+  echo -e "  ${GRY}  Cluster capabilities - no default, type one:${RST}"
+  echo -e "  ${GRY}    cdc        CDC workloads: change data capture from databases/SaaS; billed by data volume ingested; tasks on the cluster are free.${RST}"
+  echo -e "  ${GRY}    streaming  Streaming workloads: streaming ingestion/transformation and Qlik Replicate sources; billed by compute usage.${RST}"
+  prompt_val "Cluster capabilities (cdc | streaming)" "" \
+    "^([Cc][Dd][Cc]|[Ss][Tt][Rr][Ee][Aa][Mm][Ii][Nn][Gg])$" "Type cdc or streaming."
+  # Import values = the form's radio values = the lakehouse-clusters API
+  # clusterCapabilities.type (checked on a live tenant 2026-10-22).
+  if [[ "${REPLY,,}" == "streaming" ]]; then
+    QTC_CLUSTER_CAPABILITY="streaming"; QTC_CLUSTER_CAP_LABEL="Streaming workloads"
+    QTC_CLUSTER_DEFAULT="${PREFIX}-streaming"
+  else
+    QTC_CLUSTER_CAPABILITY="database";  QTC_CLUSTER_CAP_LABEL="CDC workloads"
+    QTC_CLUSTER_DEFAULT="${PREFIX}-cluster"
+  fi
+
+  prompt_val "Cluster name" "$QTC_CLUSTER_DEFAULT" "^[A-Za-z0-9][A-Za-z0-9._-]*$" \
     "Letters, digits, '.', '_' and '-'."
   QTC_CLUSTER_NAME="$REPLY"
-  echo -e "  ${GRN}${OK}  Import file: ${QTC_INTEGRATION_NAME}_AWS_import.json  (CDC workloads, Early rollout)${RST}"
+  # Cluster tags: Name is always the cluster name. Workload is the prefix for
+  # a CDC cluster; a streaming cluster repeats its own name.
+  if [[ "$QTC_CLUSTER_CAPABILITY" == "streaming" ]]; then
+    QTC_WORKLOAD_TAG="$QTC_CLUSTER_NAME"
+  else
+    QTC_WORKLOAD_TAG="$PREFIX"
+  fi
+  echo -e "  ${GRN}${OK}  Import file: ${QTC_INTEGRATION_NAME}_AWS_import.json  (${QTC_CLUSTER_CAP_LABEL}, Early rollout)${RST}"
   if [[ -z "$QTC_SPACE_ID" ]]; then
     echo -e "  ${YLW}${WRN}  ${QTC_SPACE_BLANK_MSG}${RST}"
   fi
@@ -2572,22 +2594,24 @@ echo -e "  ${GRN}${OK}  ${TFVARS}${RST}"
 # Writes the JSON the form's Import configuration button loads. Key order and
 # values match the form's own "Export form" output; the bytes match
 # skills/qlik-olh-aws-setup/scripts/olh_emit.py for the same inputs (same
-# json.dumps(indent=2) + newline, same open() call). Only CDC workloads
-# ("database") and Early rollout ("early-rollout") have been seen in a real
-# export, so those are the only values written.
+# json.dumps(indent=2) + newline, same open() call). Cluster capabilities is
+# "database" (CDC workloads, read from a real export) or "streaming" (the
+# form's radio value and the API clusterCapabilities.type, verified live
+# 2026-10-22); rollout is always Early rollout ("early-rollout").
 # Values travel on stdin, NUL-separated: Git Bash rewrites argv and env values
 # that start with '/' before a native Windows Python sees them.
 write_aws_import_json() {
   printf '%s\0' \
     "$QTC_INTEGRATION_NAME" "$QTC_SPACE_ID" "$ACCT_ID" "$KMS_KEY_ARN" "$S3_CONFIG" \
     "$MGMT_ROLE_ARN" "$INSTANCE_PROFILE_ARN" "$REGION" "$VPC_ID" \
-    "$QTC_CLUSTER_NAME" "$SG_ID" "$PREFIX" "${SUBNET_AZ_PAIRS[@]}" \
+    "$QTC_CLUSTER_NAME" "$SG_ID" "$QTC_WORKLOAD_TAG" "$QTC_CLUSTER_CAPABILITY" \
+    "${SUBNET_AZ_PAIRS[@]}" \
   | "$PY" -c '
 import json, sys
 v = sys.stdin.buffer.read().decode("utf-8").split("\0")[:-1]
-name, space, acct, kms, bucket, mgmt, profile, region, vpc, cluster, sg, prefix = v[:12]
+name, space, acct, kms, bucket, mgmt, profile, region, vpc, cluster, sg, workload, capability = v[:13]
 subnets = []
-for pair in v[12:]:
+for pair in v[13:]:
     az = pair.rsplit("|", 1)[-1]
     # The form keeps only the zone letter, e.g. "a" for us-east-1a.
     subnets.append({"availabilityZone": az[-1:], "subnet": pair.split("|", 1)[0]})
@@ -2607,12 +2631,12 @@ imp = {
     "useProxy": False,
     "clusterName": cluster,
     "clusterSpaceId": space,
-    "clusterCapabilities": "database",
+    "clusterCapabilities": capability,
     "useCustomImage": False,
     "rolloutPhaseType": "early-rollout",
     "subnetIds": subnets,
     "securityGroupIds": [{"securityGroupId": sg}],
-    "tags": [{"key": "Name", "value": cluster}, {"key": "Workload", "value": prefix}],
+    "tags": [{"key": "Name", "value": cluster}, {"key": "Workload", "value": workload}],
 }
 with open(sys.argv[1], "w", encoding="utf-8") as f:
     f.write(json.dumps(imp, indent=2) + "\n")
@@ -2649,7 +2673,11 @@ if [[ "$CLOUD" != "gcp" ]]; then
     sub="${pair%%|*}"; az="${pair##*|}"
     QI_AZ_ROWS+=("${az: -1} / ${sub}  (${az})")
   done
-  QI_TAG_ROWS=("Name = ${QTC_CLUSTER_NAME}" "Workload = ${PREFIX}")
+  QI_TAG_ROWS=("Name = ${QTC_CLUSTER_NAME}" "Workload = ${QTC_WORKLOAD_TAG}")
+  QI_CAP_SHOW="$QTC_CLUSTER_CAP_LABEL"
+  if [[ "$QTC_CLUSTER_CAPABILITY" == "streaming" ]]; then
+    QI_CAP_SHOW+="  (billed by compute usage while running)"
+  fi
   QI_APPLIED_TAGS=("Owner = ${INITIALS}" "Environment = ${ENV}" "Workload = qlik-olh"
                    "Application = open-lakehouse" "CreateDate = ${CREATE_DATE}" "ManagedBy = script")
   QI_VPCE_SHOW="${S3_VPCE_ID:-created by Terraform}"
@@ -2773,7 +2801,7 @@ else
     qi_head "3. CREATE A LAKEHOUSE CLUSTER"
     qi_row "Cluster name" "$QTC_CLUSTER_NAME"
     qi_row "Space" "$QI_SPACE_ROW"
-    qi_row "Cluster capabilities" "CDC workloads"
+    qi_row "Cluster capabilities" "$QI_CAP_SHOW"
     qi_row "Tags" "${QI_TAG_ROWS[@]}"
     qi_row "Custom image" "off"
     qi_row "Rollout phase" "Early rollout"
@@ -2824,7 +2852,7 @@ else
   QI_TAG_TEXT=""; for r in "${QI_TAG_ROWS[@]}"; do QI_TAG_TEXT+="${QI_TAG_TEXT:+$NL}${r}"; done
   html_escape_into H_ QTC_INTEGRATION_NAME QI_SPACE_ROW ACCT_ID KMS_KEY_ARN S3_CONFIG \
     MGMT_ROLE_ARN INSTANCE_PROFILE_ARN REGION VPC_ID QI_AZ_TEXT SG_ID QTC_CLUSTER_NAME \
-    QI_TAG_TEXT NODE_ROLE_ARN S3_ICEBERG S3_LANDING TFSTATE_BUCKET KINESIS_NAME \
+    QI_TAG_TEXT QI_CAP_SHOW NODE_ROLE_ARN S3_ICEBERG S3_LANDING TFSTATE_BUCKET KINESIS_NAME \
     QI_VPCE_SHOW QI_GLUE_DB QI_SSM_PATH INITIALS ENV CREATE_DATE PREFIX \
     QI_IMPORT_NAME QTC_SPACE_BLANK_MSG
   # Line breaks go in after escaping, so the <br/> survives.
@@ -2914,7 +2942,7 @@ else
 <div class="section"><h2>3. Create a lakehouse cluster</h2><div class="grid">
   <div class="k">Cluster name</div><div class="v">${H_QTC_CLUSTER_NAME}</div>
   <div class="k">Space</div><div class="v">${H_QI_SPACE_ROW}</div>
-  <div class="k">Cluster capabilities</div><div class="v">CDC workloads</div>
+  <div class="k">Cluster capabilities</div><div class="v">${H_QI_CAP_SHOW}</div>
   <div class="k">Tags</div><div class="v">${H_QI_TAG_TEXT}</div>
   <div class="k">Custom image</div><div class="v">off</div>
   <div class="k">Rollout phase</div><div class="v">Early rollout</div>

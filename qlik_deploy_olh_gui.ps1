@@ -84,6 +84,7 @@ $script:State = @{
     QlikIntegrationName = ""
     QlikSpaceId         = ""
     QlikClusterName     = ""
+    QlikClusterCapability = ""            # cdc | streaming - no default, step 3 requires a choice
     QlikImportJsonPath  = ""
 
     # ── Google Cloud ──
@@ -1777,10 +1778,10 @@ function Build-Step3 {
 
     $p.Controls.Add((New-Label "Security, Identity and Tenant Binding" 20 4 720 24 -Bold -FontSize 11))
 
-    # ── KMS ──
-    $p.Controls.Add((New-Label "KMS Symmetric Key" 20 30 300 18 -Bold))
+    # ── KMS ── (label inline, as Step 2's VPC row, to leave room for the form block)
+    $p.Controls.Add((New-Label "KMS Symmetric Key" 20 34 125 18 -Bold))
 
-    $cboKms = New-ComboBox "cboKms" 20 49 480
+    $cboKms = New-ComboBox "cboKms" 150 31 380
     $cboKms.Add_SelectedIndexChanged({
         if ($this.SelectedIndex -ge 0 -and $script:State.KmsList.Count -gt $this.SelectedIndex) {
             $sel = $script:State.KmsList[$this.SelectedIndex]
@@ -1789,7 +1790,7 @@ function Build-Step3 {
     })
     $p.Controls.Add($cboKms)
 
-    $btnRefKms = New-Btn "Refresh" 510 48 80 26 {
+    $btnRefKms = New-Btn "Refresh" 540 30 80 26 {
         Write-LogGray "  Discovering KMS keys..."
         $raw = Invoke-AwsCmd "aws kms list-aliases --region $($script:State.Region) --query `"Aliases[?contains(AliasName,'$($script:State.Prefix)')].{Alias:AliasName,KeyId:TargetKeyId}`" --output json" -AsJson -Silent
         $cbo = $script:Controls['cboKms']
@@ -1806,7 +1807,7 @@ function Build-Step3 {
     $p.Controls.Add($btnRefKms)
 
     $chkNewKms = New-Object System.Windows.Forms.CheckBox
-    $chkNewKms.Text = "Create New"; $chkNewKms.Location = [System.Drawing.Point]::new(600, 51); $chkNewKms.Size = [System.Drawing.Size]::new(110, 22)
+    $chkNewKms.Text = "Create New"; $chkNewKms.Location = [System.Drawing.Point]::new(630, 33); $chkNewKms.Size = [System.Drawing.Size]::new(110, 22)
     $chkNewKms.Add_CheckedChanged({
         $script:State.CreateNewKms = $this.Checked
         $script:Controls['cboKms'].Enabled = -not $this.Checked
@@ -1814,15 +1815,15 @@ function Build-Step3 {
     $p.Controls.Add($chkNewKms)
 
     # ── IAM roles ──
-    $p.Controls.Add((New-Sep 20 78 720))
-    $p.Controls.Add((New-Label "IAM Roles" 20 82 300 18 -Bold))
+    $p.Controls.Add((New-Sep 20 59 720))
+    $p.Controls.Add((New-Label "IAM Roles" 20 63 300 18 -Bold))
 
-    $lblRoles = New-Label "Two roles are created. The management role is assumed by Qlik from outside your account and carries the ExternalId condition below; the node role is assumed by EC2, goes into the instance profile, and gets the S3/Kinesis/KMS/Glue policy from Terraform." 20 100 720 28
+    $lblRoles = New-Label "Two roles are created. The management role is assumed by Qlik from outside your account and carries the ExternalId condition below; the node role is assumed by EC2, goes into the instance profile, and gets the S3/Kinesis/KMS/Glue policy from Terraform." 20 81 720 28
     $lblRoles.ForeColor = [System.Drawing.Color]::Gray
     $lblRoles.Font = New-Object System.Drawing.Font("Segoe UI", 8)
     $p.Controls.Add($lblRoles)
 
-    $lblRoleNames = New-Label "" 20 128 720 16
+    $lblRoleNames = New-Label "" 20 109 720 16
     $lblRoleNames.AutoEllipsis = $true
     $lblRoleNames.ForeColor = [System.Drawing.Color]::FromArgb(25, 66, 104)
     $lblRoleNames.Font = New-Object System.Drawing.Font("Consolas", 8.5)
@@ -1830,54 +1831,52 @@ function Build-Step3 {
     $p.Controls.Add($lblRoleNames)
 
     # ── QTC tenant binding ──
-    $p.Controls.Add((New-Sep 20 148 720))
-    $p.Controls.Add((New-Label "Qlik Talend Cloud tenant binding" 20 152 320 18 -Bold))
+    $p.Controls.Add((New-Sep 20 128 720))
+    $p.Controls.Add((New-Label "Qlik Talend Cloud tenant binding" 20 132 320 18 -Bold))
 
-    $lblBind = New-Label "Both values come from Administration > Network integrations in QTC, on the screen where you create the integration." 20 170 720 16
+    $p.Controls.Add((New-Label "ExternalId" 20 155 110))
+    $p.Controls.Add((New-TextBox "txtQtcExternalId" 135 153 255))
+
+    $lblBind = New-Label "Both values come from Administration > Network integrations in QTC, on the screen where you create the integration." 400 150 340 28
     $lblBind.ForeColor = [System.Drawing.Color]::Gray
     $lblBind.Font = New-Object System.Drawing.Font("Segoe UI", 8)
     $p.Controls.Add($lblBind)
 
-    $p.Controls.Add((New-Label "ExternalId" 20 190 110))
-    $p.Controls.Add((New-TextBox "txtQtcExternalId" 135 188 300))
+    $p.Controls.Add((New-Label "Qlik proxy role ARN" 20 182 130))
+    $p.Controls.Add((New-TextBox "txtQlikProxyArn" 160 180 560 "arn:aws:iam::000000000000:role/qlik-proxy-assume-role"))
 
-    $p.Controls.Add((New-Label "Qlik proxy role ARN" 20 216 130))
-    $p.Controls.Add((New-TextBox "txtQlikProxyArn" 160 214 560 "arn:aws:iam::000000000000:role/qlik-proxy-assume-role"))
-
-    $lblWhy = New-Label "Without these, the management role has no trust policy Qlik can use and the network integration will never connect." 20 239 720 16
+    $lblWhy = New-Label "Without these, the management role has no trust policy Qlik can use and the network integration will never connect." 20 205 720 16
     $lblWhy.ForeColor = [System.Drawing.Color]::FromArgb(180,130,0)
     $lblWhy.Font = New-Object System.Drawing.Font("Segoe UI", 8)
     $p.Controls.Add($lblWhy)
 
     # ── Qlik Cloud network integration form ──
-    # These three go into <name>_AWS_import.json, which the form's Import
-    # configuration button loads. Defaults follow the prefix (see VisibleChanged).
-    $p.Controls.Add((New-Sep 20 259 720))
-    $p.Controls.Add((New-Label "Qlik Cloud network integration form" 20 263 320 18 -Bold))
+    # These go into <name>_AWS_import.json, which the form's Import configuration
+    # button loads. Name defaults follow the prefix and the cluster capability
+    # (see Update-QlikFormDefaults).
+    $p.Controls.Add((New-Sep 20 224 720))
+    $p.Controls.Add((New-Label "Qlik Cloud network integration form" 20 228 320 18 -Bold))
 
-    $p.Controls.Add((New-Label "Integration name" 20 285 110))
-    $p.Controls.Add((New-TextBox "txtQlikIntegrationName" 135 283 230))
+    $p.Controls.Add((New-Label "Integration name" 20 250 110))
+    $p.Controls.Add((New-TextBox "txtQlikIntegrationName" 135 248 230))
 
-    $p.Controls.Add((New-Label "Cluster name" 380 285 90))
-    $p.Controls.Add((New-TextBox "txtQlikClusterName" 475 283 245))
-
-    $lblUnique = New-Label 'Integration name must be unique in the tenant: a name in use shows "Network integration name is already in use" and blocks Confirm.' 20 307 720 16
+    $lblUnique = New-Label 'Integration name must be unique in the tenant: a name in use shows "Network integration name is already in use" and blocks Confirm.' 375 246 365 28
     $lblUnique.ForeColor = [System.Drawing.Color]::Gray
     $lblUnique.Font = New-Object System.Drawing.Font("Segoe UI", 8)
     $p.Controls.Add($lblUnique)
 
-    $p.Controls.Add((New-Label "Qlik space ID" 20 328 110))
-    $txtSpace = New-TextBox "txtQlikSpaceId" 135 326 230
+    $p.Controls.Add((New-Label "Qlik space ID" 20 279 110))
+    $txtSpace = New-TextBox "txtQlikSpaceId" 135 277 230
     $p.Controls.Add($txtSpace)
 
-    $lblSpaceHint = New-Label "Optional. GET https://<tenant>/api/v1/spaces?name=<space name> in a browser signed in to the tenant returns it." 375 323 345 28
+    $lblSpaceHint = New-Label "Optional. GET https://<tenant>/api/v1/spaces?name=<space name> in a browser signed in to the tenant returns it." 375 275 365 28
     $lblSpaceHint.ForeColor = [System.Drawing.Color]::Gray
     $lblSpaceHint.Font = New-Object System.Drawing.Font("Segoe UI", 8)
     $p.Controls.Add($lblSpaceHint)
 
     # Shown only while the space ID is blank: an import with spaceId "" does not
     # prompt for a space, it silently picks Default_Data_Space for both.
-    $lblSpaceBlank = New-Label $script:QlikBlankSpaceNote 20 352 720 16
+    $lblSpaceBlank = New-Label $script:QlikBlankSpaceNote 20 304 720 16
     $lblSpaceBlank.ForeColor = [System.Drawing.Color]::FromArgb(180,130,0)
     $lblSpaceBlank.Font = New-Object System.Drawing.Font("Segoe UI", 8)
     $script:Controls['lblQlikSpaceBlank'] = $lblSpaceBlank
@@ -1887,32 +1886,70 @@ function Build-Step3 {
         $script:Controls['lblQlikSpaceBlank'].Visible = -not $this.Text.Trim()
     })
 
+    # Cluster name and capability share a row, as in the form's "Create a
+    # lakehouse cluster" section. Neither capability is preselected: Validate-
+    # Step 3 refuses to continue until one is chosen.
+    $p.Controls.Add((New-Label "Cluster name" 20 324 110))
+    $p.Controls.Add((New-TextBox "txtQlikClusterName" 135 322 230))
+
+    $p.Controls.Add((New-Label "Cluster capability" 377 324 100 18))
+
+    $rbCapCdc = New-Object System.Windows.Forms.RadioButton
+    $rbCapCdc.Text = "CDC workloads"; $rbCapCdc.Location = [System.Drawing.Point]::new(481, 322); $rbCapCdc.Size = [System.Drawing.Size]::new(108, 22)
+    $rbCapCdc.Add_CheckedChanged({
+        if ($this.Checked) { $script:State.QlikClusterCapability = "cdc"; Update-QlikFormDefaults }
+    })
+    $script:Controls['rbQlikCapCdc'] = $rbCapCdc
+    $p.Controls.Add($rbCapCdc)
+
+    $rbCapStream = New-Object System.Windows.Forms.RadioButton
+    $rbCapStream.Text = "Streaming workloads"; $rbCapStream.Location = [System.Drawing.Point]::new(597, 322); $rbCapStream.Size = [System.Drawing.Size]::new(140, 22)
+    $rbCapStream.Add_CheckedChanged({
+        if ($this.Checked) { $script:State.QlikClusterCapability = "streaming"; Update-QlikFormDefaults }
+    })
+    $script:Controls['rbQlikCapStreaming'] = $rbCapStream
+    $p.Controls.Add($rbCapStream)
+
+    $lblCapCdc = New-Label "CDC workloads - change data capture from databases/SaaS; billed by data volume ingested; tasks on the cluster are free." 20 347 720 14
+    $lblCapCdc.ForeColor = [System.Drawing.Color]::Gray
+    $lblCapCdc.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lblCapCdc)
+
+    $lblCapStream = New-Label "Streaming workloads - streaming ingestion/transformation and Qlik Replicate sources; billed by compute usage." 20 361 720 14
+    $lblCapStream.ForeColor = [System.Drawing.Color]::Gray
+    $lblCapStream.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $p.Controls.Add($lblCapStream)
+
     $p.Add_VisibleChanged({
         if ($this.Visible -and $script:Controls['lblRoleNames']) {
             $pfx = $script:State.Prefix
             $script:Controls['lblRoleNames'].Text =
                 "management: $pfx-mgmt-role-iam  node: $pfx-ec2-role-iam  profile: $pfx-instance-profile"
-
-            # Name defaults follow the prefix until the user types their own.
-            # Tag remembers the default last written, so an untouched box is
-            # recognised (and refreshed) after the prefix changes in step 1.
-            if ($pfx) {
-                $defaults = [ordered]@{
-                    txtQlikIntegrationName = $pfx
-                    txtQlikClusterName     = "$pfx-cluster"
-                }
-                foreach ($k in $defaults.Keys) {
-                    $ctl = $script:Controls[$k]
-                    if ($ctl -and (-not $ctl.Text -or $ctl.Text -eq [string]$ctl.Tag)) {
-                        $ctl.Text = $defaults[$k]
-                        $ctl.Tag  = $defaults[$k]
-                    }
-                }
-            }
+            Update-QlikFormDefaults
         }
     })
 
     return $p
+}
+
+function Update-QlikFormDefaults {
+    # Name defaults follow the prefix and the cluster capability until the user
+    # types their own. Tag remembers the default last written, so an untouched
+    # box is recognised (and refreshed) after the prefix changes in step 1 or
+    # the capability changes here.
+    $pfx = $script:State.Prefix
+    if (-not $pfx) { return }
+    $defaults = [ordered]@{
+        txtQlikIntegrationName = $pfx
+        txtQlikClusterName     = Get-QlikClusterNameDefault $pfx $script:State.QlikClusterCapability
+    }
+    foreach ($k in $defaults.Keys) {
+        $ctl = $script:Controls[$k]
+        if ($ctl -and (-not $ctl.Text -or $ctl.Text -eq [string]$ctl.Tag)) {
+            $ctl.Text = $defaults[$k]
+            $ctl.Tag  = $defaults[$k]
+        }
+    }
 }
 
 #endregion
@@ -2768,6 +2805,7 @@ $subLines
   Integration name: $($s.QlikIntegrationName)
   Space ID:         $(if ($s.QlikSpaceId) { $s.QlikSpaceId } else { "NOT SET (form defaults to Default_Data_Space)" })
   Cluster name:     $($s.QlikClusterName)
+  Capability:       $(if ($s.QlikClusterCapability) { (Get-QlikClusterCapability $s.QlikClusterCapability).Display } else { "NOT SET" })
 
   --- Storage ---
   S3 Iceberg:     $($script:Controls['txtS3Iceberg'].Text)
@@ -2888,7 +2926,7 @@ function Invoke-TerraformFlow {
 # Kinesis, the ExternalId, Glue, SSM, the node role or the iceberg/landing/
 # tfstate buckets; those appear only under "also created" in the txt and html.
 # Only confirmed enum values are emitted: CDC workloads = "database",
-# Early rollout = "early-rollout".
+# Streaming workloads = "streaming", Early rollout = "early-rollout".
 
 # A blank spaceId does not make the form ask for a space: it silently fills
 # both the integration space and the cluster space with Default_Data_Space,
@@ -2904,6 +2942,26 @@ function Get-QlikAzLetter {
     return $Az
 }
 
+function Get-QlikClusterCapability {
+    # The form's "Cluster capabilities" radio. Json is the import value; it is
+    # also the lakehouse-clusters API clusterCapabilities.type (both verified on
+    # a live tenant 2026-10-22). Display is what the txt, html and summary show.
+    param([string]$Capability)
+    switch ($Capability) {
+        "cdc"       { return @{ Json = "database";  Display = "CDC workloads" } }
+        "streaming" { return @{ Json = "streaming"; Display = "Streaming workloads - billed by compute usage while running" } }
+    }
+    throw "Unknown cluster capability '$Capability' (expected cdc or streaming)."
+}
+
+function Get-QlikClusterNameDefault {
+    # <prefix>-cluster for CDC (and before a capability is chosen),
+    # <prefix>-streaming for Streaming.
+    param([string]$Prefix, [string]$Capability)
+    if ($Capability -eq "streaming") { return "$Prefix-streaming" }
+    return "$Prefix-cluster"
+}
+
 function New-QlikAwsImport {
     # Same keys, in the same order, as the form's Export form file.
     param([System.Collections.IDictionary]$Ni)
@@ -2914,6 +2972,9 @@ function New-QlikAwsImport {
             subnet           = [string]$pair.Subnet
         }
     })
+    $capability = Get-QlikClusterCapability $Ni.ClusterCapability
+    # Workload tag: the prefix for CDC (unchanged), the cluster name for Streaming.
+    $workloadTag = if ($Ni.ClusterCapability -eq "streaming") { $Ni.ClusterName } else { $Ni.Prefix }
     return [ordered]@{
         providerType           = "aws"
         networkIntegrationName = [string]$Ni.IntegrationName
@@ -2929,14 +2990,14 @@ function New-QlikAwsImport {
         useProxy               = $false
         clusterName            = [string]$Ni.ClusterName
         clusterSpaceId         = [string]$Ni.SpaceId
-        clusterCapabilities    = "database"
+        clusterCapabilities    = [string]$capability.Json
         useCustomImage         = $false
         rolloutPhaseType       = "early-rollout"
         subnetIds              = $subnets
         securityGroupIds       = @([ordered]@{ securityGroupId = [string]$Ni.SgId })
         tags                   = @(
             [ordered]@{ key = "Name";     value = [string]$Ni.ClusterName }
-            [ordered]@{ key = "Workload"; value = [string]$Ni.Prefix }
+            [ordered]@{ key = "Workload"; value = [string]$workloadTag }
         )
     }
 }
@@ -2978,7 +3039,10 @@ function Format-QlikAwsIntegrationText {
     })
     $azBlock = if ($azRows.Count) { $azRows -join "`n$pad" } else { "(none)" }
 
-    $tagBlock     = "Name = $($Ni.ClusterName)`n${pad}Workload = $($Ni.Prefix)"
+    # Tags and capability exactly as the import JSON carries them.
+    $import       = New-QlikAwsImport $Ni
+    $tagBlock     = (@($import.tags | ForEach-Object { "$($_.key) = $($_.value)" })) -join "`n$pad"
+    $capability   = (Get-QlikClusterCapability $Ni.ClusterCapability).Display
     $appliedBlock = (@($Ni.AppliedTags.Keys | ForEach-Object { "$_ = $($Ni.AppliedTags[$_])" })) -join "`n$pad"
     $dryNote = if ($Ni.DryRun) { "`n  DRY-RUN    : IDs containing DRYRUN are placeholders - do not import this file." } else { "" }
     $importSpaceNote = if ($Ni.SpaceId) { "" } else { "`n  !! " + (& $wrap $script:QlikBlankSpaceNote "     ") }
@@ -3029,7 +3093,7 @@ $sep64
 $sep64
   Cluster name                      : $($Ni.ClusterName)
   Space                             : $space$spaceNote
-  Cluster capabilities              : CDC workloads
+  Cluster capabilities              : $capability
   Tags                              : $tagBlock
   Custom image                      : Off
   Rollout phase                     : Early rollout
@@ -3063,6 +3127,12 @@ function Format-QlikAwsReportHtml {
         $first = $false
     }
     if (-not $azRows.Count) { $azRows += HtmlRow "Availability Zone / Subnet" "(none)" }
+    # Cluster tags and capability exactly as the import JSON carries them.
+    $clusterTagRows = @()
+    foreach ($t in (New-QlikAwsImport $Ni).tags) {
+        $clusterTagRows += HtmlRow $(if ($clusterTagRows.Count) { "" } else { "Tags" }) "$($t.key) = $($t.value)"
+    }
+    $capability = (Get-QlikClusterCapability $Ni.ClusterCapability).Display
     $tagSpans = @($Ni.AppliedTags.Keys | ForEach-Object { "  <span class=`"tag`">$(HtmlEnc "${_}: $($Ni.AppliedTags[$_])")</span>" })
     $spaceStatus = if ($Ni.SpaceId) { "" } else { "`n" + (HtmlRow "Space" $script:QlikBlankSpaceNote) }
 
@@ -3119,9 +3189,8 @@ $(HtmlRow "Use a proxy server" "Off")
 <div class="section"><h2>3. Create a lakehouse cluster</h2><div class="grid">
 $(HtmlRow "Cluster name" $Ni.ClusterName)
 $(HtmlRow "Space" $space)
-$(HtmlRow "Cluster capabilities" "CDC workloads")
-$(HtmlRow "Tags" "Name = $($Ni.ClusterName)")
-$(HtmlRow "" "Workload = $($Ni.Prefix)")
+$(HtmlRow "Cluster capabilities" $capability)
+$($clusterTagRows -join "`n")
 $(HtmlRow "Custom image" "Off")
 $(HtmlRow "Rollout phase" "Early rollout")
 </div></div>
@@ -3716,7 +3785,7 @@ tag_createdate = "$($s.CreateDate)"
     # Qlik Cloud form outputs: the import JSON for Import configuration, plus the
     # same values as a text reference and an HTML report, in the form's order.
     $niName    = if ($s.QlikIntegrationName) { $s.QlikIntegrationName } else { $PREFIX }
-    $niCluster = if ($s.QlikClusterName)     { $s.QlikClusterName }     else { "$PREFIX-cluster" }
+    $niCluster = if ($s.QlikClusterName)     { $s.QlikClusterName }     else { Get-QlikClusterNameDefault $PREFIX $s.QlikClusterCapability }
     $importName = "${niName}_AWS_import.json"
     $importFile = Join-Path $script:ScriptDir $importName
     $ni = [ordered]@{
@@ -3742,6 +3811,7 @@ tag_createdate = "$($s.CreateDate)"
         SgId               = $SG_ID
         # 3. Create a lakehouse cluster
         ClusterName        = $niCluster
+        ClusterCapability  = $s.QlikClusterCapability
         # Also created (no field in the form)
         NodeRoleArn        = $NODE_ROLE_ARN
         IcebergBucket      = $S3_ICEBERG
@@ -4435,6 +4505,16 @@ function Validate-Step {
                 [System.Windows.Forms.MessageBox]::Show("Enter a lakehouse cluster name.", "Validation", 'OK', 'Warning') | Out-Null
                 return $false
             }
+            # No default: CDC and Streaming are billed differently, so the user picks.
+            $capability = if ($script:Controls['rbQlikCapCdc'].Checked) { "cdc" }
+                          elseif ($script:Controls['rbQlikCapStreaming'].Checked) { "streaming" }
+                          else { "" }
+            if (-not $capability) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Choose a cluster capability.`n`nCDC workloads - change data capture from databases/SaaS; billed by data volume ingested; tasks on the cluster are free.`n`nStreaming workloads - streaming ingestion/transformation and Qlik Replicate sources; billed by compute usage.",
+                    "Validation", 'OK', 'Warning') | Out-Null
+                return $false
+            }
             $spaceId = $script:Controls['txtQlikSpaceId'].Text.Trim()
             if ($spaceId -and $spaceId -notmatch '^[0-9a-f]{24}$') {
                 $r = [System.Windows.Forms.MessageBox]::Show(
@@ -4446,6 +4526,7 @@ function Validate-Step {
             $script:State.QlikProxyRoleArn    = $proxy
             $script:State.QlikIntegrationName = $niName
             $script:State.QlikClusterName     = $clName
+            $script:State.QlikClusterCapability = $capability
             $script:State.QlikSpaceId         = $spaceId
             return $true
         }

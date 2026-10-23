@@ -32,8 +32,10 @@ are about to build in.
 ## Workflow
 
 ### 1. Write the config
-Copy `scripts/config.example.json` and fill it. Keep sizing small unless told
-otherwise: `extra_buckets: ["iceberg","landing"]`, `create_kinesis: false` —
+Copy `scripts/config.example.json` and fill it. Set `cluster_capability` to
+`cdc` or `streaming` from the user's answer; leave `cluster_name`/`cluster_tags`
+out to get the defaults (`<prefix>-cluster`, or `<prefix>-streaming` with that
+name as both tags). Keep sizing small unless told otherwise: `extra_buckets: ["iceberg","landing"]`, `create_kinesis: false` —
 the integration form asks for neither; they serve later pipeline work.
 
 ### 2. Plan, then build — `scripts/olh_core.py`
